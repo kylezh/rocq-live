@@ -37,7 +37,9 @@
   rocq-live back  FILE [N]            undo the last N runs (default 1)
   rocq-live goals FILE                print the current goals
   rocq-live start FILE [LINE]         like goto, but always a fresh session
-  rocq-live stop  FILE | --all        stop the session(s) at once
+  rocq-live stop  FILE | --all [--force]  stop the session(s) at once (--all
+                                      spares busy ones, serving another request,
+                                      unless --force)
   rocq-live list                      running sessions: memory, idle time, limits
   rocq-live gc                        apply the limits now (also automatic)
   rocq-live stats [FILE] [--since 7d] what rocq-live did and saved (local log only)
@@ -115,7 +117,10 @@ import time
 
 VERSION = "0.0.0+dev"        # the release workflow writes the tag's version here
 SELF = os.path.abspath(__file__)
-SESSION_DIR = "/tmp/rocq-live-%d" % os.getuid()   # short: AF_UNIX paths <= 104
+# sessions' sockets; short (AF_UNIX paths <= 104). ROCQ_LIVE_SESSION_DIR keeps a
+# separate set (tests): `stop --all` and gc only ever see the sessions in it
+SESSION_DIR = os.environ.get("ROCQ_LIVE_SESSION_DIR") or "/tmp/rocq-live-%d" % os.getuid()
+START_WAIT = 60             # seconds a new session may take to listen (a loaded machine)
 TIMEOUT_GOTO = 600          # replaying a long prefix can be slow
 TIMEOUT_STEP = 120          # a run/query longer than this is a hang to fix
 USER_CONFIG = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
@@ -125,6 +130,7 @@ RECIPE_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser
                           "rocq-live", "recipes")
 RECIPE_KEEP = 7 * 86400     # a session's recipe (line + runs) is kept this long
 STATS_MAX = 20 << 20        # the stats log is rotated (one old copy kept) past this size
+FULL_RUN_SHARE = 0.9        # stats: a whole-file run of at least this share of sentences is a full run
 VIA = "cli"                 # "mcp" in the MCP server: recorded with each request
 MAX_ERRORS = 50             # check --all-errors reports at most this many
 WATCH_EVERY = 1.0           # seconds between memory checks while a step runs
@@ -136,6 +142,11 @@ ECHO_TAG = "ROCQ_LIVE_ARGV "
 
 class Fail(Exception):
     """A user-facing error: the message is the whole report."""
+
+
+class SessionLost(Exception):
+    """The session ended while a request was on its way or running (stopped
+    by gc, `stop --all` or a crash): the caller restores it and retries."""
 
 
 # ---------------------------------------------------------------- limits
@@ -2473,6 +2484,9 @@ def serve(path, sock, projfile):
     srv = socket.socket(socket.AF_UNIX)
     srv.bind(sock)
     srv.listen(16)
+    # busy from the start until the first request is done: a new session
+    # waiting for its first request is not idle (gc and stop --all spare it)
+    touch(sock + ".busy")
     for ext, val in ((".file", path), (".pid", str(os.getpid())), (".code", code_id())):
         with open(sock + ext, "w") as f:
             f.write(val)
@@ -2740,16 +2754,22 @@ def upgraded(sock):
 def request(sock, cmd, arg=None, proj=None):
     default = TIMEOUT_GOTO if cmd in ("goto", "check") else TIMEOUT_STEP
     timeout = float(os.environ.get("ROCQ_LIVE_TIMEOUT", default))
-    c = socket.socket(socket.AF_UNIX)
-    c.connect(sock)
     msg = {"cmd": cmd, "arg": arg, "timeout": timeout, "compact": compact_enabled(), "via": VIA,
            "log": stats_target()}
     if proj:
         msg["proj"] = proj
-    c.sendall((json.dumps(msg) + "\n").encode())
-    line = c.makefile().readline()
-    c.close()
+    c = socket.socket(socket.AF_UNIX)
+    try:
+        c.connect(sock)
+        c.sendall((json.dumps(msg) + "\n").encode())
+        line = c.makefile().readline()
+    except OSError:
+        line = ""
+    finally:
+        c.close()
     if not line:
+        if not alive(sock):
+            raise SessionLost(sock)
         return "rocq-live: the session ended; its log: %s.log" % sock, True
     resp = json.loads(line)
     return resp["out"], resp["err"]
@@ -2766,31 +2786,86 @@ def daemon_enabled():
     return os.environ.get("ROCQ_LIVE_DAEMON", "1") != "0"
 
 
-def start(file, line=0, full=False, proj=None, first=None):
+_locks = threading.local()
+
+
+class file_lock:
+    """An exclusive lock per session (a `.lock` file next to its socket):
+    callers that find no session for a file start one, not one each.
+    Re-entrant within a thread (restoring a session starts it)."""
+
+    def __init__(self, sock):
+        self.path = sock + ".lock"
+
+    def __enter__(self):
+        import fcntl
+        held = getattr(_locks, "held", None)
+        if held is None:
+            held = _locks.held = {}
+        if self.path in held:
+            held[self.path][1] += 1
+            return self
+        os.makedirs(SESSION_DIR, exist_ok=True)
+        f = open(self.path, "a")
+        fcntl.flock(f, fcntl.LOCK_EX)
+        held[self.path] = [f, 1]
+        return self
+
+    def __exit__(self, *exc):
+        held = _locks.held
+        held[self.path][1] -= 1
+        if not held[self.path][1]:
+            held.pop(self.path)[0].close()       # releases the lock
+
+
+def start(file, line=0, full=False, proj=None, first=None, reuse=False):
     """A fresh session for FILE; its first request is a goto to LINE, or
-    `first` = (cmd, arg)."""
+    `first` = (cmd, arg). With `reuse`, a current session that another
+    caller started meanwhile is used instead (no two starts for one file)."""
     path = norm(file)
     if not daemon_enabled():
         return local("goto", path, {"line": line, "full": full}, proj=proj)
     proj = proj or resolve(path)
     sock = sock_path(path)
-    kill_session(sock)
-    os.makedirs(SESSION_DIR, exist_ok=True)
-    notes = gc(adding=1)
-    projfile = sock + ".proj"
-    with open(projfile, "w") as f:
-        json.dump(proj, f)
-    log = open(sock + ".log", "w")
-    subprocess.Popen([sys.executable, "-I", SELF, "_serve", path, sock, projfile],
-                     stdin=subprocess.DEVNULL, stdout=log, stderr=log,
-                     start_new_session=True, cwd=proj["root"])
-    for _ in range(200):
-        if alive(sock):
-            break
-        time.sleep(0.05)
-    else:
-        return "rocq-live: session did not start; see %s.log" % sock, True
-    out, err = request(sock, *(first or ("goto", {"line": line, "full": full})))
+    first = first or ("goto", {"line": line, "full": full})
+    with file_lock(sock):
+        if reuse and alive(sock) and not upgraded(sock):
+            try:
+                return request(sock, first[0], first[1], proj)
+            except SessionLost:
+                pass                     # gone again: start it ourselves
+        notes = gc(adding=1)
+        for attempt in range(3):         # a session killed before its first answer: again
+            kill_session(sock)
+            projfile = sock + ".proj"
+            with open(projfile, "w") as f:
+                json.dump(proj, f)
+            log = open(sock + ".log", "w")
+            daemon = subprocess.Popen([sys.executable, "-I", SELF, "_serve", path, sock, projfile],
+                                      stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                                      start_new_session=True, cwd=proj["root"])
+            deadline = time.time() + START_WAIT
+            while not alive(sock):
+                if daemon.poll() is not None or time.time() > deadline:
+                    try:
+                        tail = open(sock + ".log").read()[-2000:].strip()
+                    except OSError:
+                        tail = ""
+                    if daemon.returncode == -9 and attempt < 2:
+                        break                 # killed from outside while starting: again
+                    return ("rocq-live: the session for %s did not start (%s)%s" % (
+                        file, "it exited with code %s" % daemon.returncode if daemon.returncode is not None
+                        else "no answer in %d s" % START_WAIT, ":\n" + tail if tail else "")), True
+                time.sleep(0.05)
+            else:
+                try:
+                    out, err = request(sock, *first)
+                    break
+                except SessionLost:
+                    continue
+        else:
+            return ("rocq-live: the session for %s ended right after it started, 3 times; see %s.log"
+                    % (file, sock)), True
     return "\n".join(notes + [describe(path, proj), out]), err
 
 
@@ -2802,9 +2877,13 @@ def goto(file, line=0, full=False):
     if not daemon_enabled():
         out, err = local("goto", path, {"line": line, "full": full}, proj=proj)
     elif not alive(sock) or upgraded(sock):
-        out, err = start(file, line, full, proj)
+        out, err = start(file, line, full, proj, reuse=True)
     else:
-        out, err = request(sock, "goto", {"line": line, "full": full}, proj)
+        try:
+            out, err = request(sock, "goto", {"line": line, "full": full}, proj)
+        except SessionLost:               # stopped under us: goto again, from a new session
+            out, err = start(file, line, full, proj, reuse=True)
+            out = "rocq-live: the session had ended (gc or a stop); started it again\n" + out
     return (note + "\n" + out if note else out), err
 
 
@@ -2840,12 +2919,14 @@ def check(file, allow_stale=False, rebuild=False, all_errors=False):
         out, err = local("check", path, arg, proj=proj)
     else:
         sock = sock_path(path)
-        if not alive(sock) or upgraded(sock):
-            out, err = start(file, proj=proj, first=("check", arg))
+        try:
+            if not alive(sock) or upgraded(sock):
+                raise SessionLost(sock)
+            out, err = request(sock, "check", arg, proj)
+        except SessionLost:
+            out, err = start(file, proj=proj, first=("check", arg), reuse=True)
             if not alive(sock):
                 return "%s\nrocq-live: %s NOT CHECKED" % (out, name), 2
-        else:
-            out, err = request(sock, "check", arg, proj)
     return "\n".join(notes + [out]), err
 
 
@@ -2873,7 +2954,10 @@ def restore(file, path, sock, why):
         raise Fail(out)
     lost = None
     for i, text in enumerate(rec["runs"]):
-        o, e = request(sock, "run", text)
+        try:
+            o, e = request(sock, "run", text)
+        except SessionLost:
+            raise Fail("rocq-live: the session for %s ended again while it was being restored" % file)
         if e:
             lost = (len(rec["runs"]) - i, text)
             break
@@ -2888,14 +2972,42 @@ def restore(file, path, sock, why):
 
 def _live(file):
     """The socket of FILE's session; restores a stopped or outdated one from
-    its recipe."""
+    its recipe (once, if several callers find it gone at the same time)."""
     path = norm(file)
     sock = sock_path(path)
-    if not alive(sock):
-        restore(file, path, sock, "the session had been stopped (gc, idle timeout or reboot)")
-    elif upgraded(sock):
-        restore(file, path, sock, "rocq-live was updated")
+    if alive(sock) and not upgraded(sock):
+        return sock
+    with file_lock(sock):
+        if not alive(sock):
+            restore(file, path, sock, "the session had been stopped (gc, idle timeout or reboot)")
+        elif upgraded(sock):
+            restore(file, path, sock, "rocq-live was updated")
     return sock
+
+
+def live_request(file, cmd, arg=None):
+    """A request to FILE's session that survives the session being stopped
+    under it: restore it from its recipe and send the request again. A run
+    or back that went through before the session ended is already in the
+    recipe (it is saved before the reply), so it is not applied twice."""
+    path = norm(file)
+    before = (load_recipe(path) or {}).get("runs")
+    try:
+        return request(_live(file), cmd, arg)
+    except SessionLost:
+        sock = sock_path(path)
+        applied = cmd in ("run", "back") and (load_recipe(path) or {}).get("runs") != before
+        with file_lock(sock):
+            if not alive(sock):
+                restore(file, path, sock, "the session ended while this request was on its way (gc or a stop)")
+        try:
+            if applied:
+                out, err = request(sock, "goals")
+                return "rocq-live: the step was applied before the session ended\n" + out, err
+            return request(sock, cmd, arg)
+        except SessionLost:
+            raise Fail("rocq-live: the session for %s ended again right after it was restored; "
+                       "see %s.log" % (file, sock))
 
 
 def at_line(file, line):
@@ -2912,26 +3024,26 @@ def run(file, text, line=None):
     if not daemon_enabled():
         return local("run", norm(file), text, line)
     at_line(file, line)
-    return request(_live(file), "run", text)
+    return live_request(file, "run", text)
 
 
 def query(file, text, line=None):
     if not daemon_enabled():
         return local("query", norm(file), text, line)
     at_line(file, line)
-    return request(_live(file), "query", text)
+    return live_request(file, "query", text)
 
 
 def back(file, n=1):
     if not daemon_enabled():
         return local("back", norm(file), int(n))
-    return request(_live(file), "back", int(n))
+    return live_request(file, "back", int(n))
 
 
 def goals(file):
     if not daemon_enabled():
         return local("goals", norm(file))
-    return request(_live(file), "goals")
+    return live_request(file, "goals")
 
 
 def try_(file, tactics, line=None):
@@ -2942,7 +3054,7 @@ def try_(file, tactics, line=None):
     if not daemon_enabled():
         return local("try", norm(file), arg, line)
     at_line(file, line)
-    return request(_live(file), "try", arg)
+    return live_request(file, "try", arg)
 
 
 def audit(file, names=None, allow=None):
@@ -2951,11 +3063,14 @@ def audit(file, names=None, allow=None):
     if not daemon_enabled():
         return local("audit", path, arg)
     sock = sock_path(path)
-    if not alive(sock) or upgraded(sock):
-        out, err = start(file, 0)
-        if not alive(sock):
-            return out, True
-    return request(sock, "audit", arg, resolve(path))
+    proj = resolve(path)
+    try:
+        if not alive(sock) or upgraded(sock):
+            raise SessionLost(sock)
+        return request(sock, "audit", arg, proj)
+    except SessionLost:
+        out, err = start(file, proj=proj, first=("audit", arg), reuse=True)
+        return out, err
 
 
 def local(cmd, path, arg=None, line=None, proj=None):
@@ -2988,13 +3103,20 @@ def local(cmd, path, arg=None, line=None, proj=None):
         s.coq.close()
 
 
-def stop(file):
+def stop(file, force=False):
     if file in ("--all", "all"):
+        # a busy session is serving another agent's request right now:
+        # stopping it would fail that request, so only --force does
         live = sweep()
+        busy = [x for x in live if x["busy"] and not force]
         for x in live:
-            kill_session(x["sock"])
-            drop_recipe(x["file"])
-        return "rocq-live: stopped %d session(s)" % len(live), False
+            if x in busy:
+                continue
+            kill_session(x["sock"])       # recipes kept: each agent's next request restores its own
+        return ("rocq-live: stopped %d session(s)%s; their recipes are kept, so each is restored "
+                "on its next use (`stop FILE` forgets one)" % (
+                    len(live) - len(busy), "; left %d busy one(s) running (another request is using "
+                    "them; --force stops them too)" % len(busy) if busy else "")), False
     # no existence check: the file of a session may have been deleted
     path = os.path.realpath(os.path.abspath(os.path.expanduser(file)))
     kill_session(sock_path(path))
@@ -3060,14 +3182,17 @@ def stats(since="all", file=None):
     lines = ["rocq-live stats: %d request(s) on %d file(s)%s" % (
         len(calls), len({e.get("file") for e in calls}),
         "" if not cutoff else " since %s" % time.strftime("%Y-%m-%d %H:%M", time.localtime(cutoff)))]
-    # time: whole-file checks against what a full run of that file costs
+    # time: whole-file checks against what a full run of that file costs. A
+    # run that re-ran (nearly) every sentence, keeping or skipping no proof,
+    # measures that cost (scaled up to all of them): agents usually goto
+    # somewhere before they check, so the first check rarely runs everything
     last_full, spent, estimate, unknown, n = {}, 0.0, 0.0, 0, 0
     for e in calls:
         if e.get("cmd") not in ("goto", "check", "audit") or not e.get("total"):
             continue
-        f = e.get("file")
-        if e.get("full"):
-            last_full[f] = (e["s"], e["total"])
+        f, sent = e.get("file"), e.get("sent", 0)
+        if e.get("full") or (sent >= FULL_RUN_SHARE * e["total"] and not e.get("kept") and not e.get("fast")):
+            last_full[f] = (e["s"] * max(1.0, e["total"] / max(sent, 1)), e["total"])
             continue
         n += 1
         if f in last_full:
@@ -3287,8 +3412,9 @@ TOOLS = [
      {"file": ("string", FILE_DOC), "n": ("integer", "How many runs to undo.")}, ["file"]),
     ("rocq_goals", "Show the current goals of FILE's session.",
      {"file": ("string", FILE_DOC)}, ["file"]),
-    ("rocq_stop", "Stop FILE's session (kills coqtop at once), or every session with all=true.",
-     {"file": ("string", FILE_DOC), "all": ("boolean", "Stop every session.")}, []),
+    ("rocq_stop", "Stop FILE's session (kills coqtop at once), or every idle session with "
+     "all=true (sessions busy with another request, perhaps another agent's, are left running).",
+     {"file": ("string", FILE_DOC), "all": ("boolean", "Stop every idle session.")}, []),
     ("rocq_stats", "What rocq-live has done and saved, from its local log: time of whole-file "
      "checks against full re-checks, sentences and proofs not re-run, errors found per "
      "--all-errors check, goal text left out by compact goals, name hints, calls and latency.",
@@ -3508,6 +3634,8 @@ def main(argv):
         out, err = safe(run if cmd == "run" else query, f, args[1], line or None)
     elif cmd == "back" and len(args) in (1, 2):
         out, err = safe(back, args[0], int(args[1]) if len(args) == 2 else 1)
+    elif cmd == "stop" and args and args[0] in ("--all", "all") and set(args[1:]) <= {"--force"}:
+        out, err = safe(stop, "--all", "--force" in args)
     elif cmd in ("goals", "stop", "info") and len(args) == 1:
         out, err = safe({"goals": goals, "stop": stop, "info": info}[cmd], args[0])
     elif cmd == "--version":

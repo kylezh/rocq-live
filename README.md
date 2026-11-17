@@ -108,7 +108,7 @@ file's imports, as a build would. Those two exist to write `.vo` files.
 | `back FILE [N]`                  | `rocq_back`     | undo the last N runs                                    |
 | `goals FILE`                     | `rocq_goals`    | current goals                                           |
 | `start FILE[:LINE]`              | `rocq_goto` with `fresh` | kill any session for FILE, start a new one     |
-| `stop FILE` / `stop --all`       | `rocq_stop`     | kill the session(s)                                     |
+| `stop FILE` / `stop --all [--force]` | `rocq_stop` | kill FILE's session (and forget its recipe), or every idle one (busy ones only with `--force`) |
 | `list`                           | `rocq_sessions` | running sessions: memory, idle time, limits             |
 | `gc`                             | —               | apply the limits now (this also happens automatically) |
 | `stats [FILE] [--since 7d]`      | `rocq_stats`    | what rocq-live did and saved, from its local log (see below) |
@@ -388,7 +388,10 @@ rocq-live stats: 21 request(s) on 4 file(s) since 2026-11-10 01:01
 
 The time saved is an estimate. Each whole-file check (`check`, or `goto`
 with no line) is compared with the most recent full run of the same file,
-one that re-ran every sentence, scaled by the file's current size. That full
+scaled by the file's current size. A full run is one that re-ran at least 90%
+of the sentences and kept or skipped no proof; its time is scaled up to all
+of them. Agents usually `goto` a line before they check, so the first check
+rarely re-runs every sentence itself. That full
 run costs about what `coqc` does. The times are rocq-live's own work, without
 the client's process start. "More than one per call" counts the extra
 errors `--all-errors` found, each a round an agent did not need. The token
@@ -443,6 +446,7 @@ rocq-live cannot know where its `.vo` files go.
 | `ROCQ_LIVE_COMPACT` | `0`: `run` and `try` show every hypothesis, not just the changed ones |
 | `ROCQ_LIVE_STATS`   | `0`: keep no stats log (`ROCQ_LIVE_STATS_FILE`: another path for it) |
 | `ROCQ_LIVE_DAEMON`  | `0`: no background process (see [Recipes](https://github.com/kylezh/rocq-live#recipes-and-the-no-daemon-mode)) |
+| `ROCQ_LIVE_SESSION_DIR` | a separate set of sessions (default `/tmp/rocq-live-$UID`); `stop --all` and GC see only the sessions in it. The tests use one |
 
 The session limits below can also be set in the environment.
 
@@ -520,6 +524,15 @@ commands and output are the same. Use it where background processes are not
 allowed (some CI runners and sandboxes).
 
 **Robustness.**
+- **Several agents at once:** a session that ends between or during an
+  agent's requests (stopped by GC, by someone's `stop --all`, or killed) is
+  restored from its recipe on the next request, and that request goes
+  through. A `run` or `back` that took effect before the session ended is
+  in the recipe already, so it is never applied twice. `stop --all` stops
+  only idle sessions, and keeps their recipes, unless `--force`. A session
+  that is starting counts as busy until it has answered its first request.
+  Agents that need a session for the same file at the same time start only
+  one between them.
 - **Crash:** if `coqtop` crashes during a step (for example a stack overflow
   in Rocq itself), the session restarts it, replays to where it was, and
   reports that the step was not applied.

@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 TOOL = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "rocq-live")
@@ -25,7 +26,10 @@ Qed.
 """
 
 
-# the tests keep their own stats log (sessions they start inherit this)
+# the tests keep their own sessions and stats log (sessions they start inherit
+# this): their `stop --all` and gc limits never touch anyone else's sessions
+SESSIONS = tempfile.mkdtemp(prefix="rlt-", dir="/tmp")
+os.environ["ROCQ_LIVE_SESSION_DIR"] = SESSIONS
 STATS = os.path.join(tempfile.mkdtemp(prefix="rocq-live-stats-"), "stats.jsonl")
 os.environ["ROCQ_LIVE_STATS_FILE"] = STATS
 
@@ -234,7 +238,7 @@ class Project(unittest.TestCase):
     def test_c_restore_from_recipe(self):
         sh("goto", self.b + ":7", check=True)
         sh("run", self.b, "unfold double.", check=True)
-        d = "/tmp/rocq-live-%d" % os.getuid()
+        d = SESSIONS
 
         def read(name):
             with open(os.path.join(d, name)) as fh:
@@ -598,6 +602,112 @@ class Project(unittest.TestCase):
         self.assertEqual(len(open(STATS).readlines()), n)
         self.assertIn("nothing recorded", sh("stats", f, "--since", "1m", env={"ROCQ_LIVE_STATS_FILE": STATS + ".none"}))
         sh("stop", f)
+        # the usual order: a goto first, so the first check re-runs nearly,
+        # not quite, everything; that still measures a full run
+        g = os.path.join(self.dir, "theories", "Stats2.v")
+        self.write("Stats2.v", "".join(lemmas))
+        sh("goto", g + ":2", check=True)
+        sh("check", g, code=0)                                          # 32 of 33 sentences
+        self.write("Stats2.v", "".join(lemmas).replace("s5 : 5 = 5.\nProof.\n  reflexivity.",
+                                                       "s5 : 5 = 5.\nProof.\n  idtac. reflexivity."))
+        sh("check", g, code=0)
+        out = sh("stats", g, check=True)
+        self.assertIn("1 whole-file check(s) took", out)
+        self.assertNotIn("no full run", out)
+        sh("stop", g)
+
+    def daemon_pid(self, f):
+        for n in os.listdir(SESSIONS):
+            if n.endswith(".sock.file") and open(os.path.join(SESSIONS, n)).read() == os.path.realpath(f):
+                return int(open(os.path.join(SESSIONS, n[:-5] + ".pid")).read())
+        return None
+
+    def test_p_session_stopped_between_steps(self):
+        """A session stopped under an agent (gc, someone's stop --all) is
+        restored on its next request, which then succeeds."""
+        sh("goto", self.b + ":7", check=True)
+        sh("run", self.b, "unfold double.", check=True)
+        os.killpg(self.daemon_pid(self.b), 9)
+        out = sh("run", self.b, "lia.", check=True)
+        self.assertIn("restored the session from its recipe", out)
+        self.assertIn("No more goals", out)
+        self.assertIn("n + n = 2 * n", sh("back", self.b, check=True))
+        sh("stop", self.b)
+
+    def test_q_stop_all_spares_busy_sessions(self):
+        import threading
+        f = os.path.join(self.dir, "theories", "Busy.v")
+        self.write("Busy.v", "".join("Lemma p%d : Nat.pow 2 17 + %d = 131072 + %d.\nProof. reflexivity. Qed.\n"
+                                     % (i, i, i) for i in range(12)))
+        result = {}
+        t = threading.Thread(target=lambda: result.update(out=sh("goto", f, code=0)))
+        t.start()
+        for _ in range(100):                                       # until it is busy
+            if any(n.endswith(".busy") for n in os.listdir(SESSIONS)):
+                break
+            time.sleep(0.05)
+        out = sh("stop", "--all", check=True)
+        self.assertIn("left 1 busy one(s) running", out)
+        t.join()
+        self.assertIn("checked up to", result["out"])               # its request went through
+        sh("stop", f)
+
+    def test_r_concurrent_starts_and_stops(self):
+        """Several agents at once, each stepping through its own file, while
+        sessions are stopped and killed around them: every step succeeds."""
+        import random, threading
+        files = []
+        for i in range(4):
+            self.write("W%d.v" % i, "Lemma w : forall n : nat, n + 0 = n.\nProof.\n  intros n.\n  "
+                       "rewrite <- plus_n_O.\n  reflexivity.\nQed.\n")
+            files.append(os.path.join(self.dir, "theories", "W%d.v" % i))
+        errors, stop = [], threading.Event()
+
+        def agent(f):
+            try:
+                for _ in range(4):
+                    out = sh("goto", f + ":4", code=0)
+                    assert "n + 0 = n" in out, out
+                    out = sh("run", f, "rewrite <- plus_n_O.", code=0)
+                    assert "n = n" in out, out
+                    sh("run", f, "exact I.", code=1)                    # a failing step
+                    out = sh("back", f, code=0)
+                    assert "n + 0 = n" in out, out
+            except AssertionError as e:
+                errors.append("%s: %s" % (os.path.basename(f), e))
+
+        def disturb():
+            rng = random.Random(1)
+            while not stop.is_set():
+                if rng.random() < 0.5:
+                    sh("stop", "--all")                                # spares busy ones
+                else:
+                    pid = self.daemon_pid(rng.choice(files))
+                    if pid:
+                        try:
+                            os.killpg(pid, 9)                           # as gc would, any time
+                        except OSError:
+                            pass
+                time.sleep(0.2)
+        both = [threading.Thread(target=agent, args=(f,)) for f in files]
+        noise = threading.Thread(target=disturb)
+        noise.start()
+        for t in both:
+            t.start()
+        # two agents starting the same file at the same moment get one session
+        same = [threading.Thread(target=lambda: sh("goto", files[0] + ":4", code=0)) for _ in range(2)]
+        for t in both:
+            t.join()
+        stop.set()
+        noise.join()
+        for t in same:
+            t.start()
+        for t in same:
+            t.join()
+        self.assertEqual(sum(1 for n in os.listdir(SESSIONS) if n.endswith(".sock.file")
+                             and open(os.path.join(SESSIONS, n)).read() == os.path.realpath(files[0])), 1)
+        self.assertEqual(errors, [])
+        sh("stop", "--all")
 
     def test_5_stop_and_list(self):
         sh("goto", self.b, check=True)
