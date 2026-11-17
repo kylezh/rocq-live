@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 """rocq-live: live Rocq proof sessions for any project, no per-project setup.
 
-  rocq-live goto  FILE[:LINE] [LINE]  proof state just before LINE (default: end
-                                      of file). Starts a session if none runs;
-                                      afterwards re-checks only from the first
-                                      changed character: edit, goto, repeat
-  rocq-live run   FILE 'TAC.'         run sentences on the current state, print
-                                      the goals or the error (error: no change)
+  rocq-live goto  FILE[:LINE] [--full]  proof state just before LINE (default:
+                                      end of file). Starts a session if none
+                                      runs; afterwards re-checks only from the
+                                      first changed character: edit, goto,
+                                      repeat. With a LINE, a finished Qed proof
+                                      before it that was not edited is taken as
+                                      Admitted (statement checked, tactics not);
+                                      --full, or no LINE, checks every proof
+  rocq-live run   FILE[:LINE] 'TAC.'  run sentences on the current state (or on
+                                      the state before LINE), print the goals
+                                      or the error (error: no change)
   rocq-live query FILE 'CMD.'         run, print, undo (Search, Check, Print, About)
   rocq-live try   FILE 'T1.' 'T2.' ..  run each tactic alone on the current state:
                                       which work, goals left; state unchanged
@@ -45,7 +50,8 @@ same `key value` lines; read at each use, so changes apply to running sessions):
   max_sessions ROCQ_LIVE_MAX_SESSIONS (default 16)
   grace        ROCQ_LIVE_GRACE        a session used this recently (seconds) is
                                       not stopped for max_sessions (default 600)
-  idle         ROCQ_LIVE_IDLE         seconds before an idle session exits (7200)
+  idle         ROCQ_LIVE_IDLE         seconds before an idle session exits (1200;
+                                      its recipe restores it on next use)
 Over max_mb, or over max_sessions (sparing sessions used within `grace`), the
 least recently used idle sessions are stopped (GC: when a session starts, after
 each request, and every second while a step runs). A step that takes a session over session_mb, or the total over
@@ -53,7 +59,15 @@ max_mb with nothing idle left to stop, is interrupted, and that session's
 coqtop is restarted to give the memory back. A busy session is never stopped.
 Environment: ROCQ_LIVE_FLAGS (load path override), ROCQ_LIVE_SWITCH,
 ROCQ_LIVE_TIMEOUT (seconds per step; default 600 for goto/start, 120 others),
-ROCQ_LIVE_TRY_TIMEOUT (seconds per tactic in `try`; default 30).
+ROCQ_LIVE_TRY_TIMEOUT (seconds per tactic in `try`; default 30),
+ROCQ_LIVE_FAST=0 (goto checks every proof, as --full),
+ROCQ_LIVE_DAEMON=0 (no background process: each call starts coqtop, rebuilds
+the state from the recipe and exits; slower per call, nothing left running).
+
+Recipes: each session saves its last goto line and the runs on top of it in
+~/.cache/rocq-live/recipes (kept 7 days). A session stopped by gc, the idle
+timeout or a reboot is restored from it on its next use (fast replay), and
+says so; `stop` forgets it.
 
 A running session watches the .vo/.vos files of the project modules it has
 loaded; when one is rebuilt, the session restarts coqtop and replays the file
@@ -83,6 +97,9 @@ TIMEOUT_STEP = 120          # a run/query longer than this is a hang to fix
 USER_CONFIG = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
                            "rocq-live", "config")
 LOG_KEEP = 86400            # the log of a dead session is kept this long (debugging)
+RECIPE_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"),
+                          "rocq-live", "recipes")
+RECIPE_KEEP = 7 * 86400     # a session's recipe (line + runs) is kept this long
 WATCH_EVERY = 1.0           # seconds between memory checks while a step runs
 GRACE_MEMORY = 5            # after an interrupt for memory, wait this long, then kill coqtop
 GRACE_TIMEOUT = 20          # same, after an interrupt for time
@@ -128,7 +145,7 @@ def limits():
             "session_mb": min(get("ROCQ_LIVE_SESSION_MB", "session_mb", total), total),
             "max_sessions": max(1, int(get("ROCQ_LIVE_MAX_SESSIONS", "max_sessions", 16))),
             "grace": get("ROCQ_LIVE_GRACE", "grace", 600),
-            "idle": get("ROCQ_LIVE_IDLE", "idle", 7200)}
+            "idle": get("ROCQ_LIVE_IDLE", "idle", 1200)}
 
 
 def fmt_mb(mb):
@@ -674,6 +691,111 @@ def axiom_allowed(ax, allowed):
     return any(ax == a or ax.endswith("." + a) or a.endswith("." + ax) for a in allowed)
 
 
+# ------------------------------------------------- fast replay
+
+# A sentence that opens a proof: a theorem-like statement without `:=`.
+STMT = re.compile(r"^(?:#\[[^\]]*\]\s*)?(?:(?:Local|Global|Polymorphic|Monomorphic|Program)\s+)*"
+                  r"(Theorem|Lemma|Corollary|Proposition|Fact|Remark|Example|Property|Goal|"
+                  r"Definition|Fixpoint|CoFixpoint|Instance)\b")
+
+
+def norm_sentence(blank, a, b):
+    return " ".join(blank[a:b].split())
+
+
+def fast_enabled():
+    return os.environ.get("ROCQ_LIVE_FAST", "1") != "0"
+
+
+def section_depths(blank):
+    """{sentence start offset: number of open Sections there}."""
+    depths, stack, off = {}, [], 0
+    while True:
+        end = next_sentence_end(blank, off)
+        if end is None:
+            return depths
+        t = norm_sentence(blank, off, end)
+        depths[off] = sum(1 for k in stack if k == "S")
+        m = re.match(r"^(Section|Module(?:\s+Type)?)\s+(?:(?:Import|Export)\s+)?([\w']+)", t)
+        if m and ":=" not in t:
+            stack.append("S" if m.group(1) == "Section" else "M")
+        elif re.match(r"^End\s+[\w']+\s*\.$", t) and stack:
+            stack.pop()
+        off = end
+
+
+def skippable(new, blank, off, end, target, edit, depths):
+    """If the sentence new[off:end] opens a finished opaque proof that ends
+    before `target`, does not overlap the edited region `edit` and can be
+    replaced by Admitted without changing what follows, return (offsets of a
+    `Proof using` sentence or None, end of the proof's Qed/Admitted)."""
+    t = norm_sentence(blank, off, end)
+    m = STMT.match(t)
+    if not m or ":=" in t or re.search(r"\bProgram\b", t.split(m.group(1))[0]):
+        return None
+    using, p, first = None, end, True
+    while True:
+        e2 = next_sentence_end(new, p)
+        if e2 is None:
+            return None
+        u = norm_sentence(blank, p, e2)
+        if not u:
+            p = e2
+            continue
+        if first and u.startswith("Proof"):
+            if re.match(r"^Proof\s+using\b", u):
+                using = (p, e2)
+            elif not re.match(r"^Proof\s*(with\b.*)?\.$", u):
+                return None              # `Proof term.` ends the proof by itself
+        elif re.match(r"^(Qed|Admitted)\s*\.$", u):
+            stop = e2
+            break
+        elif re.match(r"^(Defined|Abort|Save)\b", u) or (STMT.match(u) and ":=" not in u):
+            return None                  # transparent, aborted, or a nested proof
+        first = False
+        p = e2
+    if stop > target or (off < edit[1] and stop > edit[0]):
+        return None
+    if depths.get(off, 0) and not (using or "using" in t.split(m.group(1))[0]):
+        return None    # in a Section, Admitted would generalize differently without `Proof using`
+    return using, stop
+
+
+# ------------------------------------------------- recipes
+
+def recipe_path(path):
+    return os.path.join(RECIPE_DIR, hashlib.sha1(path.encode()).hexdigest()[:12] + ".json")
+
+
+def save_recipe(path, line, runs):
+    try:
+        os.makedirs(RECIPE_DIR, exist_ok=True)
+        tmp = recipe_path(path) + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"file": path, "line": line, "runs": runs, "saved": time.time()}, f)
+        os.replace(tmp, recipe_path(path))
+    except OSError:
+        pass
+
+
+def load_recipe(path):
+    try:
+        with open(recipe_path(path)) as f:
+            r = json.load(f)
+        if r.get("file") == path and time.time() - r.get("saved", 0) < RECIPE_KEEP:
+            return r
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def drop_recipe(path):
+    try:
+        os.unlink(recipe_path(path))
+    except OSError:
+        pass
+
+
 # --------------------------------------------------------------- session
 
 class Session:
@@ -698,6 +820,7 @@ class Session:
         self.coq = Coqtop(p["cmd"], p["flags"], p["root"], p["env"])
         self.coq.watch = self.watch
         self.done, self.text, self.runs = [(0, self.coq.state)], "", []
+        self.skipped = []          # (body start, proof end) of proofs taken as Admitted
 
     def note_loaded(self):
         out, _ = self.coq.send("Print Libraries.")
@@ -748,28 +871,76 @@ class Session:
     def line_of(self, off):
         return self.text.count("\n", 0, off) + 1
 
-    def goto(self, line):
+    def goto(self, line, full=False):
+        """State just before `line` (0: end of file). Re-checks from the first
+        changed character. Unless `full`, a finished Qed proof before the
+        target that was not edited is taken as Admitted (its statement is
+        checked, its tactics are not), as `coqc -vos` does: everything else in
+        the file (imports, scopes, notations, options) is replayed as usual."""
         with open(self.path, encoding="utf-8") as f:
             new = f.read()
         target = line_offset(new, line) if line else len(new)
         self.line = line
-        d, m = 0, min(len(self.text), len(new))       # first changed character
-        while d < m and self.text[d] == new[d]:
+        full = full or not line          # the whole file: check every proof
+        old = self.text
+        d, m = 0, min(len(old), len(new))       # first changed character
+        while d < m and old[d] == new[d]:
             d += 1
-        if d == m and len(self.text) == len(new):
+        if d == m and len(old) == len(new):
             d = len(new) + 1
+        # the edited region of the new text: [d, len(new) - common suffix)
+        if not old or d > len(new):
+            edit = (len(new) + 1, len(new) + 1)
+        else:
+            k = 0
+            while k < m - d and old[len(old) - 1 - k] == new[len(new) - 1 - k]:
+                k += 1
+            edit = (d, max(len(new) - k, d + 1))
+        if full:          # re-check proofs taken as Admitted before the target
+            for body, stop in self.skipped:
+                if body < target:
+                    d = min(d, body)
+                    break
         keep = [e for e in self.done if e[0] == 0 or (e[0] < d and e[0] <= target)]
         if keep != self.done or self.runs:
             self.coq.back_to(keep[-1][1])
         self.done, self.runs, self.text = keep, [], new
-        msgs, failed, off = [], False, self.done[-1][0]
+        self.skipped = [(b, e) for b, e in self.skipped if e <= keep[-1][0]]
+        fast = not full and fast_enabled()
+        blank = blank_comments(new) if fast else None
+        depths = section_depths(blank) if fast else {}
+        msgs, failed, off, skipped_now = [], False, self.done[-1][0], 0
         while True:
             end = next_sentence_end(new, off)
             if end is None or end > target:
                 break
             if only_blank(new[off:end]):
                 off = end; continue
-            out, err = self.coq.send(new[off:end])
+            blk = skippable(new, blank, off, end, target, edit, depths) if fast else None
+            if blk:
+                using, stop = blk
+                parts = [(new[off:end], end)]
+                if using:
+                    parts.append((new[using[0]:using[1]], using[1]))
+                parts.append(("Admitted.", stop))
+                bad = None
+                for text, at_end in parts:
+                    out, err = self.coq.send(text)
+                    if err:
+                        bad = out
+                        break
+                    self.done.append((at_end, self.coq.state))
+                if bad is None:
+                    self.skipped.append((end, stop))
+                    skipped_now += 1
+                    off = stop
+                    continue
+                # the statement itself fails: report it like any error
+                while self.done[-1][0] > off:
+                    self.done.pop()
+                out, err = bad, True
+            else:
+                out, err = self.coq.send(new[off:end])
             if err:
                 at = self.line_of(off + len(new[off:end]) - len(new[off:end].lstrip()))
                 self.coq.back_to(self.done[-1][1])
@@ -784,7 +955,36 @@ class Session:
         msgs.append(self.goals())
         msgs.append("rocq-live: checked up to %s line %d (asked for line %s)"
                     % (self.name, stop, line or "EOF"))
+        n = len(self.skipped)
+        if n:
+            msgs.append("rocq-live: %d finished proof(s) before it taken as Admitted%s (statements "
+                        "checked, tactics not; goto --full checks them)"
+                        % (n, " (%d just now)" % skipped_now if skipped_now != n else ""))
         return "\n".join(msgs), failed
+
+    def handle(self, cmd, arg):
+        """One request: (output, error?). goto/run/back also save the
+        session's recipe (line + runs) so it can be restored later."""
+        if cmd == "goto":
+            a = arg if isinstance(arg, dict) else {"line": arg or 0}
+            res = self.goto(a.get("line") or 0, bool(a.get("full")))
+        elif cmd == "run":
+            res = self.run(arg)
+        elif cmd == "query":
+            res = self.query(arg)
+        elif cmd == "back":
+            res = self.back(arg)
+        elif cmd == "goals":
+            res = self.goals(), False
+        elif cmd == "try":
+            res = self.try_(arg["tactics"], arg["each_timeout"])
+        elif cmd == "audit":
+            res = self.audit(arg.get("names") or [], arg.get("allow") or self.proj.get("axioms") or [])
+        else:
+            return "rocq-live: unknown command " + cmd, True
+        if cmd in ("goto", "run", "back", "audit"):
+            save_recipe(self.path, self.line, [t for _, t in self.runs])
+        return res
 
     def run(self, text):
         if not complete(text):
@@ -856,7 +1056,7 @@ class Session:
         declarations (or of `names`) against the allowed axioms. Checks the
         whole file first; afterwards the session is back where it was."""
         line, runs = self.line, [text for _, text in self.runs]
-        out, failed = self.goto(0)
+        out, failed = self.goto(0, full=True)
         if failed:
             return ("rocq-live audit %s: FAIL (the file does not check)\n%s" % (self.name, out)), True
         text = blank_comments(self.text)
@@ -1010,25 +1210,7 @@ def serve(path, sock, projfile):
                     session.coq.timeout, session.coq.why = TIMEOUT_GOTO, None
                     note = session.before(cmd, req.get("proj"))
                     session.coq.timeout = req.get("timeout", TIMEOUT_GOTO)
-                    if cmd == "goto":
-                        out, err = session.goto(arg)
-                        with open(sock + ".line", "w") as f:
-                            f.write(str(arg or 0))
-                    elif cmd == "run":
-                        out, err = session.run(arg)
-                    elif cmd == "query":
-                        out, err = session.query(arg)
-                    elif cmd == "back":
-                        out, err = session.back(arg)
-                    elif cmd == "goals":
-                        out, err = session.goals(), False
-                    elif cmd == "try":
-                        out, err = session.try_(arg["tactics"], arg["each_timeout"])
-                    elif cmd == "audit":
-                        out, err = session.audit(arg.get("names") or [],
-                                                 arg.get("allow") or session.proj.get("axioms") or [])
-                    else:
-                        out, err = "rocq-live: unknown command " + cmd, True
+                    out, err = session.handle(cmd, arg)
                     # memory: a step that was stopped for memory, or a coqtop
                     # still over the per-session limit, keeps its heap: restart
                     # coqtop to give it back (the file is replayed)
@@ -1107,7 +1289,7 @@ def alive(sock):
         return False
 
 
-SUFFIXES = ("", ".file", ".pid", ".busy", ".used", ".proj", ".code", ".line")
+SUFFIXES = ("", ".file", ".pid", ".busy", ".used", ".proj", ".code")
 
 
 def kill_session(sock):
@@ -1164,6 +1346,13 @@ def sweep():
                 os.unlink(sock + ".log")
             except OSError:
                 pass
+    if os.path.isdir(RECIPE_DIR):
+        for n in os.listdir(RECIPE_DIR):
+            if now - mtime(os.path.join(RECIPE_DIR, n), now) > RECIPE_KEEP:
+                try:
+                    os.unlink(os.path.join(RECIPE_DIR, n))
+                except OSError:
+                    pass
     live.sort(key=lambda x: x["used"])
     return live
 
@@ -1239,8 +1428,16 @@ def describe(path, proj):
         os.path.basename(path), proj["desc"], proj["kind"], proj["root"])
 
 
-def start(file, line=0):
+def daemon_enabled():
+    """ROCQ_LIVE_DAEMON=0: no background process; each call rebuilds the
+    state from the file's recipe (fast replay) and exits."""
+    return os.environ.get("ROCQ_LIVE_DAEMON", "1") != "0"
+
+
+def start(file, line=0, full=False):
     path = norm(file)
+    if not daemon_enabled():
+        return local("goto", path, {"line": line, "full": full})
     proj = resolve(path)
     sock = sock_path(path)
     kill_session(sock)
@@ -1259,74 +1456,150 @@ def start(file, line=0):
         time.sleep(0.05)
     else:
         return "rocq-live: session did not start; see %s.log" % sock, True
-    out, err = request(sock, "goto", line)
+    out, err = request(sock, "goto", {"line": line, "full": full})
     return "\n".join(notes + [describe(path, proj), out]), err
 
 
-def goto(file, line=0):
+def goto(file, line=0, full=False):
     path = norm(file)
+    if not daemon_enabled():
+        return local("goto", path, {"line": line, "full": full})
     sock = sock_path(path)
     if not alive(sock) or upgraded(sock):
-        return start(file, line)
+        return start(file, line, full)
     proj = resolve(path)              # rebuild imports; maybe a new load path
-    return request(sock, "goto", line, proj)
+    return request(sock, "goto", {"line": line, "full": full}, proj)
+
+
+_notes = []          # notes for the next reply (a restored session)
+
+
+def restore(file, path, sock, why):
+    """Start a session again from its recipe: the last goto line (fast
+    replay) and the runs made on top of it."""
+    rec = load_recipe(path)
+    if rec is None:
+        raise Fail("rocq-live: no session for %s; start one with: rocq-live goto %s LINE"
+                   % (file, file))
+    t0 = time.time()
+    out, err = start(file, rec["line"])
+    if not alive(sock):
+        raise Fail(out)
+    lost = None
+    for i, text in enumerate(rec["runs"]):
+        o, e = request(sock, "run", text)
+        if e:
+            lost = (len(rec["runs"]) - i, text)
+            break
+    msg = ("rocq-live: %s; restored the session from its recipe in %.1f s: line %s and %d run(s)"
+           % (why, time.time() - t0, rec["line"] or "EOF", len(rec["runs"]) - (lost[0] if lost else 0)))
+    if lost:
+        msg += "; the run `%s` no longer applies, so it and %d later one(s) were dropped" % (lost[1], lost[0] - 1)
+    if err:
+        msg += "\n" + out
+    _notes.append(msg)
 
 
 def _live(file):
+    """The socket of FILE's session; restores a stopped or outdated one from
+    its recipe."""
     path = norm(file)
     sock = sock_path(path)
     if not alive(sock):
-        raise Fail("rocq-live: no session for %s; start one with: rocq-live goto %s LINE"
-                   % (file, file))
-    if upgraded(sock):
-        # rocq-live itself was updated: restart the session where it was
-        try:
-            line = int(open(sock + ".line").read())
-        except (OSError, ValueError):
-            line = 0
-        out, err = start(file, line)
-        if not alive(sock):
-            raise Fail(out)
-        _upgrade_notes.append("rocq-live: rocq-live was updated; restarted the session at %s "
-                              "line %s (runs made on top of it are gone)" % (file, line or "EOF"))
+        restore(file, path, sock, "the session had been stopped (gc, idle timeout or reboot)")
+    elif upgraded(sock):
+        restore(file, path, sock, "rocq-live was updated")
     return sock
 
 
-_upgrade_notes = []
+def at_line(file, line):
+    """With an explicit LINE, run/query/try first go to the state before it."""
+    if line is None:
+        return None
+    out, err = goto(file, line)
+    if err:
+        raise Fail(out)
+    return None
 
 
-def run(file, text):
+def run(file, text, line=None):
+    if not daemon_enabled():
+        return local("run", norm(file), text, line)
+    at_line(file, line)
     return request(_live(file), "run", text)
 
 
-def query(file, text):
+def query(file, text, line=None):
+    if not daemon_enabled():
+        return local("query", norm(file), text, line)
+    at_line(file, line)
     return request(_live(file), "query", text)
 
 
 def back(file, n=1):
+    if not daemon_enabled():
+        return local("back", norm(file), int(n))
     return request(_live(file), "back", int(n))
 
 
 def goals(file):
+    if not daemon_enabled():
+        return local("goals", norm(file))
     return request(_live(file), "goals")
 
 
-def try_(file, tactics):
+def try_(file, tactics, line=None):
     if not tactics:
         raise Fail("rocq-live: give at least one tactic to try")
     each = float(os.environ.get("ROCQ_LIVE_TRY_TIMEOUT", "30"))
-    return request(_live(file), "try", {"tactics": list(tactics), "each_timeout": each})
+    arg = {"tactics": list(tactics), "each_timeout": each}
+    if not daemon_enabled():
+        return local("try", norm(file), arg, line)
+    at_line(file, line)
+    return request(_live(file), "try", arg)
 
 
 def audit(file, names=None, allow=None):
     path = norm(file)
+    arg = {"names": names or [], "allow": allow or []}
+    if not daemon_enabled():
+        return local("audit", path, arg)
     sock = sock_path(path)
-    if not alive(sock):
+    if not alive(sock) or upgraded(sock):
         out, err = start(file, 0)
         if not alive(sock):
             return out, True
+    return request(sock, "audit", arg, resolve(path))
+
+
+def local(cmd, path, arg=None, line=None):
+    """No-daemon mode: a coqtop for this call only. The state comes from the
+    recipe (the last goto line, fast replay, and the runs on top), or from
+    LINE when given; goto/run/back save the recipe again."""
     proj = resolve(path)
-    return request(sock, "audit", {"names": names or [], "allow": allow or []}, proj)
+    s = Session(path, proj)
+    try:
+        default = TIMEOUT_GOTO if cmd in ("goto", "audit") else TIMEOUT_STEP
+        timeout = float(os.environ.get("ROCQ_LIVE_TIMEOUT", default))
+        if cmd in ("goto", "audit"):
+            s.coq.timeout = timeout
+            return s.handle(cmd, arg)
+        rec = load_recipe(path) if line is None else None
+        s.coq.timeout = TIMEOUT_GOTO
+        out, failed = s.goto(line if line is not None else (rec["line"] if rec else 0))
+        if failed:
+            return out, True
+        notes = []
+        for text in (rec["runs"] if rec else []):
+            o, e = s.run(text)
+            if e:
+                notes.append("rocq-live: the saved run `%s` no longer applies; dropped it and later ones" % text)
+                break
+        s.coq.timeout = timeout
+        res, err = s.handle(cmd, arg)       # run/back save the recipe again
+        return "\n".join(notes + [res]), err
+    finally:
+        s.coq.close()
 
 
 def stop(file):
@@ -1334,9 +1607,12 @@ def stop(file):
         live = sweep()
         for x in live:
             kill_session(x["sock"])
+            drop_recipe(x["file"])
         return "rocq-live: stopped %d session(s)" % len(live), False
     # no existence check: the file of a session may have been deleted
-    kill_session(sock_path(os.path.realpath(os.path.abspath(os.path.expanduser(file)))))
+    path = os.path.realpath(os.path.abspath(os.path.expanduser(file)))
+    kill_session(sock_path(path))
+    drop_recipe(path)                     # an explicit stop: forget the state too
     return "rocq-live: session stopped", False
 
 
@@ -1420,9 +1696,9 @@ def safe(fn, *args):
         out, err = str(e), True
     except (OSError, subprocess.SubprocessError, ValueError) as e:
         out, err = "rocq-live: %s: %s" % (type(e).__name__, e), True
-    if _upgrade_notes:
-        out = "\n".join(_upgrade_notes + [out])
-        del _upgrade_notes[:]
+    if _notes:
+        out = "\n".join(_notes + [out])
+        del _notes[:]
     if err:
         out = "\n".join([out] + explain(out))
     return out, err
@@ -1441,22 +1717,28 @@ TOOLS = [
      "first character changed in FILE, so the loop is: edit the file, rocq_goto, repeat. "
      "Reports the first error before LINE, if any.",
      {"file": ("string", FILE_DOC), "line": ("integer", LINE_DOC),
+      "full": ("boolean", "Also re-check finished proofs before LINE (by default a finished "
+               "Qed proof you did not edit is taken as Admitted: its statement is checked, its "
+               "tactics are not)."),
       "fresh": ("boolean", "Kill any running session for FILE and start a new one.")},
      ["file"]),
     ("rocq_run", "Run tactics/commands (complete sentences ending in '.') on top of the "
      "session's current state and return the new goals or the error. An error leaves the "
      "state unchanged. Use to try tactics without editing the file; rocq_back undoes.",
-     {"file": ("string", FILE_DOC), "text": ("string", "Sentences, e.g. 'intros x. simpl.'")},
+     {"file": ("string", FILE_DOC), "text": ("string", "Sentences, e.g. 'intros x. simpl.'"),
+      "line": ("integer", "Optional: first go to the state before this line (as rocq_goto).")},
      ["file", "text"]),
     ("rocq_query", "Run a command, return its output, then undo it: Search, Check, Print, "
      "About, Locate, Print Assumptions, Compute ...",
-     {"file": ("string", FILE_DOC), "text": ("string", "e.g. 'Search (_ + 0 = _).'")},
+     {"file": ("string", FILE_DOC), "text": ("string", "e.g. 'Search (_ + 0 = _).'"),
+      "line": ("integer", "Optional: first go to the state before this line (as rocq_goto).")},
      ["file", "text"]),
     ("rocq_try", "Try several tactics, each alone, on the session's current state and report "
      "which work and how many goals each leaves (best first); the state is unchanged. Use it "
      "instead of guessing one tactic at a time; then rocq_run the winner.",
      {"file": ("string", FILE_DOC),
-      "tactics": ("array", "Tactics, e.g. [\"lia\", \"auto\", \"reflexivity\"] (a final '.' is added if missing)")},
+      "tactics": ("array", "Tactics, e.g. [\"lia\", \"auto\", \"reflexivity\"] (a final '.' is added if missing)"),
+      "line": ("integer", "Optional: first go to the state before this line (as rocq_goto).")},
      ["file", "tactics"]),
     ("rocq_audit", "Check FILE for unfinished or assumed proofs: Admitted/admit/give_up, "
      "Axiom/Parameter declarations, and `Print Assumptions` of every declaration (or of NAMES) "
@@ -1499,14 +1781,15 @@ def tool_list():
 def call_tool(name, a):
     f = a.get("file", "")
     if name == "rocq_goto":
-        return safe(start if a.get("fresh") else goto, f, int(a.get("line") or 0))
+        return safe(start if a.get("fresh") else goto, f, int(a.get("line") or 0), bool(a.get("full")))
+    at = int(a["line"]) if a.get("line") else None
     if name == "rocq_run":
-        return safe(run, f, a.get("text", ""))
+        return safe(run, f, a.get("text", ""), at)
     if name == "rocq_query":
-        return safe(query, f, a.get("text", ""))
+        return safe(query, f, a.get("text", ""), at)
     if name == "rocq_try":
         tacs = a.get("tactics") or []
-        return safe(try_, f, [tacs] if isinstance(tacs, str) else tacs)
+        return safe(try_, f, [tacs] if isinstance(tacs, str) else tacs, at)
     if name == "rocq_audit":
         return safe(audit, f, a.get("names") or [], a.get("allow") or [])
     if name == "rocq_back":
@@ -1623,7 +1906,8 @@ def main(argv):
     elif cmd == "gc":
         out, err = safe(collect)
     elif cmd == "try" and len(args) >= 2:
-        out, err = safe(try_, args[0], args[1:])
+        f, line, _ = split_file_line(args[:1])
+        out, err = safe(try_, f, args[1:], line or None)
     elif cmd == "audit" and args:
         names, allow, rest = [], [], args[1:]
         while rest:
@@ -1633,12 +1917,14 @@ def main(argv):
                 names.append(rest[0]); rest = rest[1:]
         out, err = safe(audit, args[0], names, allow)
     elif cmd in ("start", "goto") and args:
-        f, line, rest = split_file_line(args)
+        full = "--full" in args
+        f, line, rest = split_file_line([x for x in args if x != "--full"])
         if rest:
             print(usage, file=sys.stderr); return 2
-        out, err = safe(start if cmd == "start" else goto, f, line)
+        out, err = safe(start if cmd == "start" else goto, f, line, full)
     elif cmd in ("run", "query") and len(args) == 2:
-        out, err = safe(run if cmd == "run" else query, args[0], args[1])
+        f, line, _ = split_file_line(args[:1])
+        out, err = safe(run if cmd == "run" else query, f, args[1], line or None)
     elif cmd == "back" and len(args) in (1, 2):
         out, err = safe(back, args[0], int(args[1]) if len(args) == 2 else 1)
     elif cmd in ("goals", "stop", "info") and len(args) == 1:

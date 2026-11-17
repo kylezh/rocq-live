@@ -193,6 +193,54 @@ class Project(unittest.TestCase):
         self.assertIn("double n = 2 * n", sh("goals", self.b, check=True))
         sh("stop", self.b)
 
+    def test_b_fast_replay(self):
+        f = os.path.join(self.dir, "theories", "F.v")
+        self.write("F.v", "Lemma l1 : 1 = 1. Proof. exact I. Qed.\n"      # broken, but finished
+                   "Section S. Variable k : nat.\nLemma s1 : k = k. Proof. reflexivity. Qed.\nEnd S.\n"
+                   "Lemma l2 : 2 = 2.\nProof.\n  reflexivity.\nQed.\n")
+        out = sh("goto", f + ":7", check=True)           # inside l2, before `reflexivity.`
+        self.assertIn("2 = 2", out)
+        self.assertIn("1 finished proof(s) before it taken as Admitted", out)   # l1; s1 is in a Section
+        out = sh("goto", f + ":7", "--full", check=False)
+        self.assertIn("error in the sentence at theories/F.v line 1", out)
+        out = sh("goto", f, check=False)                  # no LINE: every proof
+        self.assertIn("error in the sentence at theories/F.v line 1", out)
+        # an edited proof is checked even without --full
+        sh("start", f + ":7", check=True)
+        self.write("F.v", open(f).read().replace("exact I.", "exact I. "))
+        out = sh("goto", f + ":7", check=False)
+        self.assertIn("error in the sentence at theories/F.v line 1", out)
+        sh("stop", f)
+
+    def test_c_restore_from_recipe(self):
+        sh("goto", self.b + ":7", check=True)
+        sh("run", self.b, "unfold double.", check=True)
+        d = "/tmp/rocq-live-%d" % os.getuid()
+
+        def read(name):
+            with open(os.path.join(d, name)) as fh:
+                return fh.read()
+        sock = [l for l in os.listdir(d) if l.endswith(".sock.file") and read(l) == os.path.realpath(self.b)][0]
+        pid = int(read(sock[:-5] + ".pid"))
+        os.killpg(pid, 9)                                   # as gc or a reboot would
+        out = sh("goals", self.b, check=True)
+        self.assertIn("restored the session from its recipe", out)
+        self.assertIn("line 7 and 1 run(s)", out)
+        self.assertIn("n + n = 2 * n", out)
+        sh("stop", self.b)
+        self.assertIn("no session", sh("goals", self.b, check=False))   # stop forgets it
+
+    def test_d_no_daemon(self):
+        sh("stop", "--all")
+        env = {"ROCQ_LIVE_DAEMON": "0"}
+        self.assertIn("double n = 2 * n", sh("goto", self.b + ":7", check=True, env=env))
+        self.assertIn("n + n = 2 * n", sh("run", self.b, "unfold double.", check=True, env=env))
+        self.assertIn("n + n = 2 * n", sh("goals", self.b, check=True, env=env))    # from the recipe
+        self.assertIn("double n = 2 * n", sh("back", self.b, check=True, env=env))
+        self.assertIn("1 of 2 tactics work", sh("try", self.b, "lia", "unfold double; lia", check=True, env=env))
+        self.assertIn("0 session(s)", sh("list", check=True))                         # nothing left running
+        sh("stop", self.b, env=env)
+
     def test_5_stop_and_list(self):
         sh("goto", self.b, check=True)
         self.assertIn(os.path.realpath(self.b), sh("list", check=True))

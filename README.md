@@ -29,7 +29,7 @@ Gemini CLI, …).
 ## Install
 
 ```sh
-curl -fsSL -o ~/.local/bin/rocq-live https://raw.githubusercontent.com/<you>/rocq-live/main/rocq-live
+curl -fsSL -o ~/.local/bin/rocq-live https://raw.githubusercontent.com/kylezh/rocq-live/master/rocq-live
 chmod +x ~/.local/bin/rocq-live      # any directory on PATH works
 ```
 
@@ -76,8 +76,8 @@ All tools are marked read-only (`readOnlyHint`): they never edit files. A
 
 | CLI                              | MCP tool        | does                                                    |
 |----------------------------------|-----------------|---------------------------------------------------------|
-| `goto FILE[:LINE]`               | `rocq_goto`     | state just before LINE (default: end); starts a session |
-| `run FILE 'tac1. tac2.'`         | `rocq_run`      | run on the current state; an error changes nothing      |
+| `goto FILE[:LINE] [--full]`      | `rocq_goto`     | state just before LINE (default: end, checking every proof); starts a session |
+| `run FILE[:LINE] 'tac1. tac2.'`  | `rocq_run`      | run on the current state (or on the state before LINE); an error changes nothing |
 | `query FILE 'Search …'`          | `rocq_query`    | run, print, undo (Search, Check, Print, About, …)       |
 | `try FILE 'lia' 'auto' …`        | `rocq_try`      | each tactic alone on the current state: which work, goals left (best first); state unchanged |
 | `audit FILE [NAME…] [--allow AX,…]` | `rocq_audit` | `Admitted`/`admit`/axioms, and `Print Assumptions` of each declaration against the allowed axioms: PASS/FAIL |
@@ -103,7 +103,32 @@ rocq-live: 3 of 4 tactics work; state unchanged; best: [1] lia (no goals left)
 [4] reflexivity -> FAILS: Error: The relation and is not a declared reflexive relation. ...
 ```
 
-Each tactic gets `ROCQ_LIVE_TRY_TIMEOUT` seconds (default 30).
+Each tactic gets `ROCQ_LIVE_TRY_TIMEOUT` seconds (default 30). `query` and
+`try` also accept `FILE:LINE`.
+
+**Fast replay.** `goto FILE:LINE` checks the statement of each finished `Qed`
+proof before LINE, but takes the proof itself as `Admitted`, as `coqc -vos`
+does. Everything else in the file (imports, scopes, notations, options,
+`Defined` bodies) is replayed in place, so the goal at LINE is the same; only
+the tactic work in earlier proofs is skipped. The reply says how many proofs
+were taken as Admitted. Proofs are always checked in full when:
+- you edited them since the session last read the file;
+- the proof is `Defined`, `Program`, `Proof term.`, or inside a `Section`
+  without `Proof using` (Admitted would generalize it differently);
+- you pass `--full`, or give no LINE at all (the whole file).
+
+`audit` always checks in full. Turn fast replay off with `ROCQ_LIVE_FAST=0`.
+
+Measured on a file with 12 proofs that each take tactic time, followed by the
+lemma being worked on (Rocq 9.0, M-series Mac):
+
+| | time |
+|---|---|
+| fresh session, `goto --full` | 3.36 s |
+| fresh session, `goto` (fast replay) | 0.25 s |
+| one step in a live session | 0.08 s |
+| restoring a stopped session from its recipe | 0.33 s |
+| one call in no-daemon mode | 0.19 s |
 
 **`audit`** fails on any `Admitted`, `admit` or `give_up`, on an `Axiom` or
 `Parameter` that is not allowed, and on any declaration whose `Print
@@ -155,6 +180,8 @@ when `_CoqProject` `.vo`s should be rebuilt automatically.
 | `ROCQ_LIVE_SWITCH`  | opam switch (`path` = coqtop on PATH)                     |
 | `ROCQ_LIVE_TIMEOUT` | seconds per step (default 600 for goto, 120 otherwise)    |
 | `ROCQ_LIVE_TRY_TIMEOUT` | seconds per tactic in `try` (default 30)             |
+| `ROCQ_LIVE_FAST`    | `0`: `goto` checks every proof (as `--full`)              |
+| `ROCQ_LIVE_DAEMON`  | `0`: no background process (see [Recipes](#recipes-and-the-no-daemon-mode)) |
 
 The session limits below can also be set in the environment.
 
@@ -176,7 +203,7 @@ each use, so editing the file changes running sessions too.
 | `session_mb`   | `ROCQ_LIVE_SESSION_MB`   | `max_mb`           | one session                 |
 | `max_sessions` | `ROCQ_LIVE_MAX_SESSIONS` | 16                 | how many sessions (soft, see below) |
 | `grace`        | `ROCQ_LIVE_GRACE`        | 600                | seconds a session is spared from the count limit after its last use |
-| `idle`         | `ROCQ_LIVE_IDLE`         | 7200               | seconds before an idle session exits |
+| `idle`         | `ROCQ_LIVE_IDLE`         | 1200               | seconds before an idle session exits (its next use restores it from the recipe) |
 
 ```
 # ~/.config/rocq-live/config
@@ -212,15 +239,31 @@ step runs, rocq-live compares the sessions with the limits.
 $ rocq-live list
 2.1 GB   busy     /work/proj/theories/Big.v
 140 MB   12m idle /work/proj/theories/Small.v
-2 session(s), 2.2 GB; limits: 8 sessions, 8.0 GB total, 8.0 GB per session, 120m idle
+2 session(s), 2.2 GB; limits: 16 sessions (sparing those used in the last 10m), 8.0 GB total, 8.0 GB per session, 20m idle
 ```
+
+### Recipes and the no-daemon mode
+
+Rocq cannot save a live session's state to a file (`Write State` was removed
+in 2021), so rocq-live saves a **recipe** instead: the session's last `goto`
+line and the runs made on top of it. Recipes live in `~/.cache/rocq-live/recipes/`
+and are kept for 7 days. When a session was stopped by GC, by the idle
+timeout, or by a reboot, its next use restores it: fast replay to the line,
+then the runs. The reply says so, and how long it took. An explicit `stop`
+forgets the recipe.
+
+With `ROCQ_LIVE_DAEMON=0`, nothing runs in the background. Each call starts a
+`coqtop`, rebuilds the state from the recipe, answers, saves the recipe and
+exits. Each call is slower, since it replays the file from the start, but the
+commands and output are the same. Use it where background processes are not
+allowed (some CI runners and sandboxes).
 
 **Robustness.**
 - **Crash:** if `coqtop` crashes during a step (for example a stack overflow
   in Rocq itself), the session restarts it, replays to where it was, and
   reports that the step was not applied.
 - **Upgrade:** when rocq-live is updated, each session started by the old
-  version is restarted at its last line on its next use.
+  version is restored from its recipe on its next use.
 - **Cleanup:** files left by dead sessions are cleaned up, and their logs are
   kept for a day.
 
