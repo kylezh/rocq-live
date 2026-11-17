@@ -1,0 +1,47 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "rocq-live"
+dynamic = ["version"]
+description = "Live Rocq proof sessions for coding agents: a CLI and MCP server, with no per-project setup"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.9"
+authors = [{ name = "Kyle Zhang" }]
+keywords = ["rocq", "coq", "proof-assistant", "theorem-proving", "mcp", "mcp-server", "ai-agents", "llm"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Scientific/Engineering :: Mathematics",
+    "Topic :: Software Development :: Quality Assurance",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/kylezh/rocq-live"
+Repository = "https://github.com/kylezh/rocq-live"
+Issues = "https://github.com/kylezh/rocq-live/issues"
+
+[project.scripts]
+rocq-live = "rocq_live.cli:entry"
+
+[tool.hatch.version]
+path = "rocq-live"            # VERSION = "..." in the script
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/rocq_live"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"rocq-live" = "rocq_live/cli.py"
+
+[tool.hatch.build.targets.sdist]
+include = ["rocq-live", "src/", "tests/", "README.md", "LICENSE", "pyproject.toml"]

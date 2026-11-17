@@ -25,9 +25,14 @@ Qed.
 """
 
 
+# ROCQ_LIVE_CMD: test an installed command (e.g. a wheel's `rocq-live`)
+# instead of the script in this repository
+CMD = os.environ["ROCQ_LIVE_CMD"].split() if os.environ.get("ROCQ_LIVE_CMD") else [sys.executable, TOOL]
+
+
 def sh(*args, check=None, env=None):
     e = dict(os.environ, **(env or {}))
-    r = subprocess.run([sys.executable, TOOL] + list(args), capture_output=True, text=True, env=e)
+    r = subprocess.run(CMD + list(args), capture_output=True, text=True, env=e)
     if check is not None:
         assert (r.returncode == 0) == check, "rocq-live %s -> %d\n%s%s" % (args, r.returncode, r.stdout, r.stderr)
     return r.stdout + r.stderr
@@ -110,7 +115,7 @@ class Project(unittest.TestCase):
              "params": {"name": "rocq_run", "arguments": {"file": self.b, "text": "bogus."}}},
             {"jsonrpc": "2.0", "id": 6, "method": "nope"},
         ]
-        p = subprocess.Popen([sys.executable, TOOL, "mcp"], stdin=subprocess.PIPE,
+        p = subprocess.Popen(CMD + ["mcp"], stdin=subprocess.PIPE,
                              stdout=subprocess.PIPE, text=True)
         for m in msgs:
             p.stdin.write(json.dumps(m) + "\n")

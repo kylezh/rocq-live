@@ -340,6 +340,28 @@ def run_tool(cmd, cwd, env, what, shell=False):
     return r.stdout
 
 
+def toplevel_shim():
+    """An executable that runs this script, for dune's --toplevel (dune needs
+    a program; this file may not be executable, e.g. when installed from a
+    wheel). Written once per Python and script location."""
+    d = os.path.join(os.path.dirname(RECIPE_DIR), "bin")
+    shim = os.path.join(d, "toplevel-" + hashlib.sha1((sys.executable + SELF).encode()).hexdigest()[:12])
+    body = "#!/bin/sh\nexec %s -I %s \"$@\"\n" % (shlex.quote(sys.executable), shlex.quote(SELF))
+    try:
+        with open(shim) as f:
+            if f.read() == body:
+                return shim
+    except OSError:
+        pass
+    os.makedirs(d, exist_ok=True)
+    tmp = shim + ".tmp%d" % os.getpid()
+    with open(tmp, "w") as f:
+        f.write(body)
+    os.chmod(tmp, 0o755)
+    os.replace(tmp, shim)
+    return shim
+
+
 def dune_flags(path, env, proj_dir):
     """`dune rocq top` / `dune coq top` builds FILE's imports, then runs the
     toplevel with the right flags. The toplevel is this script, which only
@@ -355,7 +377,7 @@ def dune_flags(path, env, proj_dir):
         rocq_first = False
     errors = []
     for sub in (["rocq", "coq"] if rocq_first else ["coq", "rocq"]):
-        r = subprocess.run(["dune", sub, "top", "--display=quiet", "--toplevel=" + SELF,
+        r = subprocess.run(["dune", sub, "top", "--display=quiet", "--toplevel=" + toplevel_shim(),
                             os.path.basename(path)], cwd=os.path.dirname(path), env=e,
                            capture_output=True, text=True)
         for line in r.stdout.splitlines():
@@ -1874,6 +1896,8 @@ def mcp():
             prev.append(last["*"])
         last[key or "*"] = done
         threading.Thread(target=ordered, args=(msg, prev, done), daemon=True).start()
+    for ev in list(last.values()):        # stdin closed: answer what is in flight
+        ev.wait()
     return 0
 
 
@@ -1938,5 +1962,10 @@ def main(argv):
     return 1 if err else 0
 
 
-if __name__ == "__main__":
+def entry():
+    """Console-script entry point (pip/uv install)."""
     sys.exit(main(sys.argv[1:]))
+
+
+if __name__ == "__main__":
+    entry()

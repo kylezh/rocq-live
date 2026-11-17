@@ -29,12 +29,18 @@ Gemini CLI, …).
 ## Install
 
 ```sh
+uv tool install rocq-live            # or: pipx install rocq-live
+```
+
+Or run it without installing (`uvx rocq-live …`), or take the single file:
+
+```sh
 curl -fsSL -o ~/.local/bin/rocq-live https://raw.githubusercontent.com/kylezh/rocq-live/master/rocq-live
 chmod +x ~/.local/bin/rocq-live      # any directory on PATH works
 ```
 
 Requirements: Python ≥ 3.9 and `coqtop` (Rocq 9.x; see
-[Compatibility](#compatibility)). opam and dune are optional. macOS or Linux.
+[Compatibility](https://github.com/kylezh/rocq-live#compatibility)). opam and dune are optional. macOS or Linux.
 
 ## Connect your agent
 
@@ -181,7 +187,7 @@ when `_CoqProject` `.vo`s should be rebuilt automatically.
 | `ROCQ_LIVE_TIMEOUT` | seconds per step (default 600 for goto, 120 otherwise)    |
 | `ROCQ_LIVE_TRY_TIMEOUT` | seconds per tactic in `try` (default 30)             |
 | `ROCQ_LIVE_FAST`    | `0`: `goto` checks every proof (as `--full`)              |
-| `ROCQ_LIVE_DAEMON`  | `0`: no background process (see [Recipes](#recipes-and-the-no-daemon-mode)) |
+| `ROCQ_LIVE_DAEMON`  | `0`: no background process (see [Recipes](https://github.com/kylezh/rocq-live#recipes-and-the-no-daemon-mode)) |
 
 The session limits below can also be set in the environment.
 
@@ -332,4 +338,6 @@ limits.
 
 ## License
 
-[MIT](LICENSE)
+[MIT](https://github.com/kylezh/rocq-live/blob/master/LICENSE)
+
+<!-- mcp-name: io.github.kylezh/rocq-live -->
