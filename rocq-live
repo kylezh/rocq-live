@@ -1,0 +1,1655 @@
+#!/usr/bin/env python3
+"""rocq-live: live Rocq proof sessions for any project, no per-project setup.
+
+  rocq-live goto  FILE[:LINE] [LINE]  proof state just before LINE (default: end
+                                      of file). Starts a session if none runs;
+                                      afterwards re-checks only from the first
+                                      changed character: edit, goto, repeat
+  rocq-live run   FILE 'TAC.'         run sentences on the current state, print
+                                      the goals or the error (error: no change)
+  rocq-live query FILE 'CMD.'         run, print, undo (Search, Check, Print, About)
+  rocq-live try   FILE 'T1.' 'T2.' ..  run each tactic alone on the current state:
+                                      which work, goals left; state unchanged
+  rocq-live audit FILE [NAME..] [--allow AX,..]  Admitted/admit/axioms and
+                                      Print Assumptions vs the allowed axioms
+  rocq-live back  FILE [N]            undo the last N runs (default 1)
+  rocq-live goals FILE                print the current goals
+  rocq-live start FILE [LINE]         like goto, but always a fresh session
+  rocq-live stop  FILE | --all        stop the session(s) at once
+  rocq-live list                      running sessions: memory, idle time, limits
+  rocq-live gc                        apply the limits now (also automatic)
+  rocq-live info  FILE                project root, toolchain and load path found
+  rocq-live mcp                       serve the same commands as MCP tools (stdio)
+
+Each session is a background process holding one `coqtop -emacs` for one file,
+so a step costs only that step: no prefix replays.
+
+Project detection (from FILE's directory upwards, nearest marker wins):
+  .rocq-live     optional config, `key value` lines (see below)
+  dune-project   load path from `dune coq top` (also builds what FILE imports)
+  _CoqProject    load path from its -Q/-R/-I/-arg lines (build it yourself)
+Toolchain: the config's `switch`, else $ROCQ_LIVE_SWITCH, else the current opam
+switch if it has coqtop, else coqtop on PATH.
+
+.rocq-live keys (all optional; relative paths are from its directory):
+  switch   rocq-9.0               opam switch (`path`: use coqtop on PATH)
+  flags    -Q theories My         load path flags, verbatim
+  loadpath scripts/loadpath.sh {file}   command printing the flags; may build
+  build    make -j8 vos           command run before each start/goto
+  axioms   classic functional_extensionality_dep   axioms `audit` accepts
+
+Limits (machine-wide; environment, else ~/.config/rocq-live/config with the
+same `key value` lines; read at each use, so changes apply to running sessions):
+  max_mb       ROCQ_LIVE_MAX_MB       all sessions together (default: half the RAM)
+  session_mb   ROCQ_LIVE_SESSION_MB   one session (default: max_mb)
+  max_sessions ROCQ_LIVE_MAX_SESSIONS (default 16)
+  grace        ROCQ_LIVE_GRACE        a session used this recently (seconds) is
+                                      not stopped for max_sessions (default 600)
+  idle         ROCQ_LIVE_IDLE         seconds before an idle session exits (7200)
+Over max_mb, or over max_sessions (sparing sessions used within `grace`), the
+least recently used idle sessions are stopped (GC: when a session starts, after
+each request, and every second while a step runs). A step that takes a session over session_mb, or the total over
+max_mb with nothing idle left to stop, is interrupted, and that session's
+coqtop is restarted to give the memory back. A busy session is never stopped.
+Environment: ROCQ_LIVE_FLAGS (load path override), ROCQ_LIVE_SWITCH,
+ROCQ_LIVE_TIMEOUT (seconds per step; default 600 for goto/start, 120 others),
+ROCQ_LIVE_TRY_TIMEOUT (seconds per tactic in `try`; default 30).
+
+A running session watches the .vo/.vos files of the project modules it has
+loaded; when one is rebuilt, the session restarts coqtop and replays the file
+to the last goto line and the runs on top, and says so. `goto` also rebuilds
+FILE's imports first (dune, or the `build`/`loadpath` command), so: edit an
+imported file, then goto, and the new version is used.
+"""
+import hashlib
+import json
+import os
+import re
+import select
+import shlex
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+
+VERSION = "0.1.0"
+SELF = os.path.abspath(__file__)
+SESSION_DIR = "/tmp/rocq-live-%d" % os.getuid()   # short: AF_UNIX paths <= 104
+TIMEOUT_GOTO = 600          # replaying a long prefix can be slow
+TIMEOUT_STEP = 120          # a run/query longer than this is a hang to fix
+USER_CONFIG = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+                           "rocq-live", "config")
+LOG_KEEP = 86400            # the log of a dead session is kept this long (debugging)
+WATCH_EVERY = 1.0           # seconds between memory checks while a step runs
+GRACE_MEMORY = 5            # after an interrupt for memory, wait this long, then kill coqtop
+GRACE_TIMEOUT = 20          # same, after an interrupt for time
+ECHO_ENV = "ROCQ_LIVE_ECHO_ARGV"
+ECHO_TAG = "ROCQ_LIVE_ARGV "
+
+
+class Fail(Exception):
+    """A user-facing error: the message is the whole report."""
+
+
+# ---------------------------------------------------------------- limits
+
+def phys_mb():
+    try:
+        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / (1 << 20)
+    except (ValueError, OSError, AttributeError):
+        return 16384.0
+
+
+def limits():
+    """Machine-wide session limits, read at each use so a change applies to
+    running sessions: environment, else ~/.config/rocq-live/config (`key
+    value` lines), else defaults."""
+    cfg = {}
+    try:
+        with open(USER_CONFIG, encoding="utf-8") as f:
+            for raw in f:
+                key, _, val = raw.split("#")[0].strip().partition(" ")
+                if key:
+                    cfg[key] = val.strip()
+    except OSError:
+        pass
+
+    def get(env, key, default):
+        val = os.environ.get(env) or cfg.get(key)
+        try:
+            return float(val) if val else default
+        except ValueError:
+            return default
+    total = get("ROCQ_LIVE_MAX_MB", "max_mb", phys_mb() / 2)
+    return {"max_mb": total,
+            "session_mb": min(get("ROCQ_LIVE_SESSION_MB", "session_mb", total), total),
+            "max_sessions": max(1, int(get("ROCQ_LIVE_MAX_SESSIONS", "max_sessions", 16))),
+            "grace": get("ROCQ_LIVE_GRACE", "grace", 600),
+            "idle": get("ROCQ_LIVE_IDLE", "idle", 7200)}
+
+
+def fmt_mb(mb):
+    return "%.1f GB" % (mb / 1024) if mb >= 1024 else "%d MB" % mb
+
+
+def group_mb():
+    """Resident memory (MB) of every process group, from one `ps` call. A
+    session is a process group (its daemon and coqtop)."""
+    r = subprocess.run(["ps", "-A", "-o", "pgid=,rss="], capture_output=True, text=True)
+    out = {}
+    for line in r.stdout.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+            g = int(parts[0])
+            out[g] = out.get(g, 0) + int(parts[1]) / 1024
+    return out
+
+
+# ---------------------------------------------------------------- sentences
+
+def next_sentence_end(text, start):
+    """End offset (just past the terminator) of the sentence starting at
+    `start`, or None if there is no complete sentence there. A sentence ends
+    at a `.` followed by white space or the end of text, outside comments
+    (nested) and strings, and not part of `..`; a `{` or `}` that starts a
+    sentence is a sentence of its own (focusing braces)."""
+    i, n, depth, started = start, len(text), 0, False
+    while i < n:
+        c = text[i]
+        if text.startswith("(*", i):
+            depth += 1; i += 2; continue
+        if depth:
+            if text.startswith("*)", i):
+                depth -= 1; i += 2
+            else:
+                i += 1
+            continue
+        if c == '"':                      # string; "" is an escaped quote
+            i += 1
+            while i < n and not (text[i] == '"' and not text.startswith('""', i)):
+                i += 2 if text.startswith('""', i) else 1
+            i += 1; started = True; continue
+        if not started and c in "{}":
+            return i + 1
+        if c == "." and (i + 1 == n or text[i + 1].isspace()) and not (i > 0 and text[i - 1] == "."):
+            return i + 1
+        if not c.isspace():
+            started = True
+        i += 1
+    return None
+
+
+def strip_comments(text):
+    out, depth, i = [], 0, 0
+    while i < len(text):
+        if text.startswith("(*", i):
+            depth += 1; i += 2
+        elif depth and text.startswith("*)", i):
+            depth -= 1; i += 2
+        else:
+            if not depth:
+                out.append(text[i])
+            i += 1
+    return "".join(out)
+
+
+def only_blank(text):
+    """True if `text` holds no sentence (only white space and comments)."""
+    return re.sub(r"\s", "", strip_comments(text)) == ""
+
+
+def complete(text):
+    """True if `text` is a non-empty sequence of complete sentences."""
+    off, n = 0, 0
+    while True:
+        end = next_sentence_end(text, off)
+        if end is None:
+            return n > 0 and only_blank(text[off:])
+        off, n = end, n + 1
+
+
+def line_offset(text, line):
+    """Offset of the start of 1-based `line` (len(text) past the end)."""
+    off = 0
+    for _ in range(line - 1):
+        nl = text.find("\n", off)
+        if nl < 0:
+            return len(text)
+        off = nl + 1
+    return off
+
+
+# ------------------------------------------------------------ project setup
+
+def find_up(start, names):
+    """Nearest directory at or above `start` holding one of `names`; returns
+    (dir, set of the names present there) or (None, set())."""
+    d = start
+    while True:
+        here = {n for n in names if os.path.exists(os.path.join(d, n))}
+        if here:
+            return d, here
+        parent = os.path.dirname(d)
+        if parent == d:
+            return None, set()
+        d = parent
+
+
+def read_config(path):
+    cfg = {}
+    with open(path, encoding="utf-8") as f:
+        for raw in f:
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            key, _, val = line.partition(" ")
+            if key not in ("switch", "flags", "loadpath", "build", "axioms"):
+                raise Fail("rocq-live: %s: unknown key %r (switch, flags, loadpath, build, axioms)"
+                           % (path, key))
+            cfg[key] = val.strip()
+    return cfg
+
+
+def parse_coqproject(path):
+    """The load-path flags of a _CoqProject, with absolute directories."""
+    base = os.path.dirname(path)
+    with open(path, encoding="utf-8") as f:
+        toks = shlex.split(f.read(), comments=True)
+    flags, i = [], 0
+    while i < len(toks):
+        t = toks[i]
+        if t in ("-Q", "-R") and i + 2 < len(toks):
+            flags += [t, os.path.join(base, toks[i + 1]), toks[i + 2]]; i += 3
+        elif t == "-I" and i + 1 < len(toks):
+            flags += [t, os.path.join(base, toks[i + 1])]; i += 2
+        elif t == "-arg" and i + 1 < len(toks):
+            flags += shlex.split(toks[i + 1]); i += 2
+        else:
+            i += 1                        # file names and makefile options
+    return flags
+
+
+_env_cache = {}
+
+
+def toolchain_env(switch, root):
+    """(environment, description) for running coqtop. `switch` is an opam
+    switch name, "path", or None (pick: current opam switch with coqtop, else
+    PATH)."""
+    key = (switch, root)
+    if key in _env_cache:
+        return _env_cache[key]
+    env, desc = dict(os.environ), "coqtop on PATH"
+    env.pop(ECHO_ENV, None)
+    if switch != "path" and shutil.which("opam"):
+        sw = switch
+        if not sw:
+            r = subprocess.run(["opam", "switch", "show"], cwd=root, capture_output=True, text=True)
+            sw = r.stdout.strip() if r.returncode == 0 else None
+        if sw:
+            r = subprocess.run(["opam", "exec", "--switch=" + sw, "--", "env", "-0"],
+                               cwd=root, capture_output=True)
+            if r.returncode == 0:
+                oenv = dict(kv.split("=", 1) for kv in r.stdout.decode().split("\0") if "=" in kv)
+                if shutil.which("coqtop", path=oenv.get("PATH")) or switch:
+                    env, desc = oenv, "opam switch " + sw
+            elif switch:
+                raise Fail("rocq-live: cannot select opam switch %s:\n%s" % (sw, r.stderr.decode()))
+    elif switch and switch != "path":
+        raise Fail("rocq-live: config asks for opam switch %s but opam is not installed" % switch)
+    env.pop(ECHO_ENV, None)
+    _env_cache[key] = (env, desc)
+    return env, desc
+
+
+def toplevel_cmd(env):
+    if shutil.which("coqtop", path=env.get("PATH")):
+        return ["coqtop"]
+    if shutil.which("rocq", path=env.get("PATH")):
+        return ["rocq", "repl"]
+    raise Fail("rocq-live: no coqtop (or rocq) found; set `switch` in .rocq-live or ROCQ_LIVE_SWITCH")
+
+
+def run_tool(cmd, cwd, env, what, shell=False):
+    """Run a setup command; its stdout on success, Fail with its output else."""
+    r = subprocess.run(cmd, cwd=cwd, env=env, shell=shell, capture_output=True, text=True)
+    if r.returncode != 0:
+        raise Fail("rocq-live: %s failed (exit %d); FILE's imports do not build:\n%s%s"
+                   % (what, r.returncode, r.stdout[-6000:], r.stderr[-6000:]))
+    return r.stdout
+
+
+def dune_flags(path, env, proj_dir):
+    """`dune rocq top` / `dune coq top` builds FILE's imports, then runs the
+    toplevel with the right flags. The toplevel is this script, which only
+    prints its argv as JSON (paths may contain spaces, so `--toplevel=echo`
+    is not enough). Projects on `(using rocq ...)` need `dune rocq top`, those
+    on `(using coq ...)` need `dune coq top` (removed in newer dune): try the
+    one the project names first, then the other."""
+    e = dict(env); e[ECHO_ENV] = "1"
+    try:
+        with open(os.path.join(proj_dir, "dune-project"), encoding="utf-8") as f:
+            rocq_first = re.search(r"\(using\s+rocq\b", f.read()) is not None
+    except OSError:
+        rocq_first = False
+    errors = []
+    for sub in (["rocq", "coq"] if rocq_first else ["coq", "rocq"]):
+        r = subprocess.run(["dune", sub, "top", "--display=quiet", "--toplevel=" + SELF,
+                            os.path.basename(path)], cwd=os.path.dirname(path), env=e,
+                           capture_output=True, text=True)
+        for line in r.stdout.splitlines():
+            if line.startswith(ECHO_TAG):
+                return json.loads(line[len(ECHO_TAG):])
+        errors.append("$ dune %s top ... (exit %d)\n%s%s"
+                      % (sub, r.returncode, r.stdout[-4000:], r.stderr[-4000:]))
+        if "unknown command" not in r.stderr:
+            break                     # a real error (a build failure): report it
+    raise Fail("rocq-live: dune could not build FILE's imports or give its load path "
+               "(is %s in a coq.theory/rocq.theory?):\n%s" % (path, "\n".join(errors)))
+
+
+def resolve(path, build=True):
+    """Project of `path`: {root, kind, flags, env, desc, cmd}. With `build`,
+    first run whatever brings FILE's imports up to date."""
+    start_dir = os.path.dirname(path)
+    cfg_dir, _ = find_up(start_dir, [".rocq-live"])
+    proj_dir, here = find_up(start_dir, ["dune-project", "dune-workspace", "_CoqProject"])
+    root = cfg_dir or proj_dir or find_up(start_dir, [".git"])[0] or start_dir
+    cfg = read_config(os.path.join(cfg_dir, ".rocq-live")) if cfg_dir else {}
+    switch = cfg.get("switch") or os.environ.get("ROCQ_LIVE_SWITCH") or None
+    env, desc = toolchain_env(switch, root)
+    qfile = shlex.quote(path)
+    if build and cfg.get("build"):
+        run_tool(cfg["build"].replace("{file}", qfile), root, env, "build command", shell=True)
+    if os.environ.get("ROCQ_LIVE_FLAGS"):
+        kind, flags = "ROCQ_LIVE_FLAGS", shlex.split(os.environ["ROCQ_LIVE_FLAGS"])
+    elif cfg.get("flags"):
+        kind, flags = ".rocq-live flags", shlex.split(cfg["flags"])
+    elif cfg.get("loadpath"):
+        cmd = cfg["loadpath"].replace("{file}", qfile)
+        kind, flags = ".rocq-live loadpath", shlex.split(run_tool(cmd, root, env, "loadpath command", shell=True))
+    elif "dune-project" in here or "dune-workspace" in here:
+        kind, flags = "dune", dune_flags(path, env, proj_dir)
+    elif "_CoqProject" in here:
+        kind, flags = "_CoqProject", parse_coqproject(os.path.join(proj_dir, "_CoqProject"))
+    else:
+        kind, flags = "none (no .rocq-live, dune-project or _CoqProject found)", []
+    # relative directories in flags are relative to the root
+    out, i = [], 0
+    while i < len(flags):
+        if flags[i] in ("-Q", "-R") and i + 2 < len(flags):
+            out += [flags[i], os.path.join(root, flags[i + 1]), flags[i + 2]]; i += 3
+        elif flags[i] == "-I" and i + 1 < len(flags):
+            out += [flags[i], os.path.join(root, flags[i + 1])]; i += 2
+        else:
+            out.append(flags[i]); i += 1
+    return {"root": root, "kind": kind, "flags": out, "env": env, "desc": desc,
+            "cmd": toplevel_cmd(env), "axioms": cfg.get("axioms", "").split()}
+
+
+# ------------------------------------------------------------ coqtop driver
+
+PROMPT = re.compile(r"<prompt>[^\n]*? < (\d+) \|[^\n]*?</prompt>")
+ERROR = re.compile(r"^Error:", re.M)
+
+
+class StepTimeout(Exception):
+    pass
+
+
+class Coqtop:
+    """One coqtop -emacs process. `send(text)` runs complete sentences and
+    returns (output, error?); `state` is the state id after them."""
+
+    def __init__(self, cmd, flags, cwd, env):
+        self.p = subprocess.Popen(cmd + ["-q", "-emacs"] + flags, cwd=cwd, env=env,
+                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                  stderr=subprocess.STDOUT)
+        self.marks, self.timeout, self.buf = 0, TIMEOUT_GOTO, b""
+        self.watch, self.why = None, None   # watch(): reason to interrupt, or None
+        out, _ = self._read_until(lambda s: PROMPT.search(s), TIMEOUT_GOTO)
+        self.state = int(PROMPT.findall(out)[-1])
+
+    def _read_until(self, done, timeout):
+        """Read until done(output); after `timeout` seconds interrupt the
+        running command (SIGINT) and keep reading. (output, interrupted?)"""
+        deadline, interrupted = time.time() + timeout, False
+        next_watch = time.time() + WATCH_EVERY
+        while True:
+            s = self.buf.decode("utf-8", "replace")
+            if done(s):
+                self.buf = b""
+                return s, interrupted
+            if self.watch and not interrupted and time.time() >= next_watch:
+                next_watch = time.time() + WATCH_EVERY
+                why = self.watch()
+                if why:                   # over a memory limit: stop the step now
+                    self.why = why
+                    os.kill(self.p.pid, signal.SIGINT)
+                    interrupted, deadline = True, time.time() + GRACE_MEMORY
+                    continue
+            left = deadline - time.time()
+            if left <= 0:
+                if interrupted:
+                    # SIGINT did not stop it (some Rocq versions do not poll
+                    # for it in the VM): kill coqtop; the session restarts it
+                    self.p.kill()
+                    self.p.wait()
+                    raise StepTimeout("coqtop did not respond to an interrupt; killed it")
+                os.kill(self.p.pid, signal.SIGINT)
+                interrupted, deadline = True, time.time() + GRACE_TIMEOUT
+                continue
+            r, _, _ = select.select([self.p.stdout], [], [], min(left, 1.0))
+            if r:
+                chunk = os.read(self.p.stdout.fileno(), 1 << 16)
+                if not chunk:
+                    raise StepTimeout("coqtop exited:\n" + s[-4000:])
+                self.buf += chunk
+
+    def send(self, text):
+        """Run `text`, then a marker command whose message (a unique name)
+        followed by a prompt means all is done."""
+        self.marks += 1
+        mark = "rocq_live_mark_%d" % self.marks
+        self.p.stdin.write((text + "\nFail Check %s.\n" % mark).encode())
+        self.p.stdin.flush()
+
+        def done(s):
+            k = s.find(mark + " was not found")
+            return k >= 0 and PROMPT.search(s, k)
+        out, interrupted = self._read_until(done, self.timeout)
+        k = out.find(mark + " was not found")
+        body = out[:out.rfind("The command has indeed failed", 0, k)]
+        self.state = int(PROMPT.findall(out[k:])[-1])
+        error = bool(ERROR.search(body)) or interrupted
+        if interrupted and self.why:
+            body += "\nrocq-live: step interrupted: %s" % self.why
+        elif interrupted:
+            body += "\nrocq-live: step interrupted after %d s (ROCQ_LIVE_TIMEOUT)" % self.timeout
+        return clean(body), error
+
+    def back_to(self, state):
+        self.send("BackTo %d." % state)
+
+    def close(self):
+        try:
+            self.p.stdin.close()
+            self.p.wait(10)
+        except Exception:
+            self.p.kill()
+
+
+def clean(out):
+    """coqtop -emacs output without prompts and markup."""
+    out = PROMPT.sub("", out)
+    out = re.sub(r"</?infomsg>|</?warning>", "", out)
+    return re.sub(r"\n{3,}", "\n\n", out).strip("\n")
+
+
+# ------------------------------------------------- watching loaded modules
+
+LOADED = re.compile(r"^\s+([A-Za-z0-9_'.]+)\s*$", re.M)
+_hashes = {}
+
+
+def bindings(flags, root):
+    """(logical prefix, directory) of each -Q/-R inside the project: only
+    project modules are watched (installed libraries do not change)."""
+    out, i = [], 0
+    while i < len(flags):
+        if flags[i] in ("-Q", "-R") and i + 2 < len(flags):
+            d = os.path.realpath(flags[i + 1])
+            if d == root or d.startswith(root + os.sep):
+                out.append((flags[i + 2], d))
+            i += 3
+        else:
+            i += 1
+    return out
+
+
+def products(libraries_output, binds):
+    """Build products coqtop may have loaded for the project modules listed
+    by `Print Libraries`: the .vo and the .vos of each binding that fits."""
+    paths = []
+    for lib in LOADED.findall(libraries_output):
+        for prefix, d in binds:
+            if lib.startswith(prefix + "."):
+                rel = lib[len(prefix) + 1:].replace(".", os.sep)
+                paths += [os.path.join(d, rel + ".vo"), os.path.join(d, rel + ".vos")]
+    return paths
+
+
+def fingerprint(path):
+    """Content hash (None if missing), recomputed only when mtime/size change:
+    a product restored with the same content is not a change."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    key = (st.st_mtime_ns, st.st_size)
+    hit = _hashes.get(path)
+    if hit is None or hit[0] != key:
+        with open(path, "rb") as f:
+            hit = (key, hashlib.sha1(f.read()).hexdigest())
+        _hashes[path] = hit
+    return hit[1]
+
+
+# ------------------------------------------------- try / audit helpers
+
+def error_text(out, limit=240):
+    """The message of the first error in `out`, on one line."""
+    k = out.find("Error:")
+    if k < 0:
+        lines = out.strip().splitlines()
+        return lines[-1] if lines else "error"
+    msg = " ".join(out[k + len("Error:"):].split())
+    msg = msg.split(" rocq-live:")[0]
+    return "Error: " + (msg[:limit] + " ..." if len(msg) > limit else msg)
+
+
+def goal_count(out):
+    """Goals left in a tactic's output: 0 when it closed them."""
+    if re.search(r"No more (sub)?goals|This subproof is complete|All the remaining goals are on the shelf", out):
+        return 0
+    m = re.search(r"^(\d+) (?:focused )?goals?\b", out, re.M)
+    return int(m.group(1)) if m else 1
+
+
+def goals_word(n):
+    return "no goals left" if n == 0 else "%d goal%s left" % (n, "" if n == 1 else "s")
+
+
+def first_lines(text, n):
+    lines = text.strip("\n").splitlines()
+    return "\n".join(lines[:n] + (["... (%d more lines)" % (len(lines) - n)] if len(lines) > n else []))
+
+
+def indent(text):
+    return "\n".join("    " + l for l in text.splitlines())
+
+
+def short_list(names, n=5):
+    return ", ".join(names[:n]) + (" and %d more" % (len(names) - n) if len(names) > n else "")
+
+
+def blank_comments(text):
+    """`text` with comments and strings replaced by spaces (newlines kept), so
+    offsets and line numbers still match the file."""
+    out, i, depth, n = list(text), 0, 0, len(text)
+    while i < n:
+        if text.startswith("(*", i):
+            depth += 1; out[i] = out[i + 1] = " "; i += 2; continue
+        if depth:
+            if text.startswith("*)", i):
+                depth -= 1; out[i] = out[i + 1] = " "; i += 2; continue
+            if text[i] != "\n":
+                out[i] = " "
+            i += 1; continue
+        if text[i] == '"':
+            j = i + 1
+            while j < n and not (text[j] == '"' and not text.startswith('""', j)):
+                j += 2 if text.startswith('""', j) else 1
+            for k in range(i, min(j + 1, n)):
+                if out[k] != "\n":
+                    out[k] = " "
+            i = j + 1; continue
+        i += 1
+    return "".join(out)
+
+
+ADMITS = re.compile(r"\b(Admitted\s*\.|admit\b|give_up\b|Admit\s+Obligations\b)")
+AXIOM_DECL = re.compile(r"(?m)^\s*(?:#\[[^\]]*\]\s*)?(?:(?:Local|Global|Polymorphic|Monomorphic)\s+)*"
+                        r"(Axioms?|Conjectures?|Parameters?)\s+([A-Za-z_][\w']*)")
+DECL = re.compile(r"^(?:#\[[^\]]*\]\s*)?(?:(?:Local|Global|Program|Polymorphic|Monomorphic|Equations)\s+)*"
+                  r"(Theorem|Lemma|Corollary|Proposition|Fact|Remark|Example|Property|Definition|"
+                  r"Fixpoint|CoFixpoint|Instance)\s+([A-Za-z_][\w']*)")
+
+
+def scan_admits(text):
+    """(line, what) of each admit and axiom declaration in `text` (comments
+    already blanked)."""
+    found = []
+    for m in ADMITS.finditer(text):
+        found.append((text.count("\n", 0, m.start()) + 1, m.group(1).split()[0].rstrip(".")))
+    for m in AXIOM_DECL.finditer(text):
+        found.append((text.count("\n", 0, m.start(1)) + 1, "%s %s" % (m.group(1), m.group(2))))
+    return sorted(found)
+
+
+def declarations(text):
+    """Qualified names of the file's declarations (modules tracked; nothing
+    inside a Module Type, whose contents are not constants)."""
+    names, stack, off = [], [], 0
+    while True:
+        end = next_sentence_end(text, off)
+        if end is None:
+            break
+        sent = " ".join(text[off:end].split())
+        off = end
+        m = re.match(r"^(?:Module|Declare Module)\s+Type\s+([\w']+)", sent)
+        if m:
+            if ":=" not in sent:
+                stack.append(("T", m.group(1)))
+            continue
+        m = re.match(r"^Module\s+(?:(?:Import|Export)\s+)?([\w']+)", sent)
+        if m:
+            if ":=" not in sent:
+                stack.append(("M", m.group(1)))
+            continue
+        m = re.match(r"^Section\s+([\w']+)", sent)
+        if m:
+            stack.append(("S", m.group(1)))
+            continue
+        m = re.match(r"^End\s+([\w']+)\s*\.$", sent)
+        if m:
+            for k in range(len(stack) - 1, -1, -1):
+                if stack[k][1] == m.group(1):
+                    del stack[k:]
+                    break
+            continue
+        m = DECL.match(sent)
+        if m and not any(k == "T" for k, _ in stack):
+            names.append(".".join([n for k, n in stack if k == "M"] + [m.group(2)]))
+    return names
+
+
+def axioms_of(out):
+    """Axiom names in `Print Assumptions` output ([] when closed)."""
+    axs, section = [], None
+    for line in out.splitlines():
+        if re.match(r"^[A-Z][A-Za-z ]+:$", line):
+            section = line[:-1]
+        elif section == "Axioms" and re.match(r"^\S+ :", line):
+            axs.append(line.split(" :")[0])
+    return axs
+
+
+def axiom_allowed(ax, allowed):
+    """`Print Assumptions` prints the shortest unambiguous name: match either
+    way round on a qualified suffix."""
+    return any(ax == a or ax.endswith("." + a) or a.endswith("." + ax) for a in allowed)
+
+
+# --------------------------------------------------------------- session
+
+class Session:
+    """The file's checked prefix: `done` lists (end offset, coqtop state) of
+    each sentence checked, `text` the file as last read, `runs` stacks
+    (state before, text) of each run, `line` the last goto target, `loaded`
+    the fingerprint of each watched product when it was loaded."""
+
+    def __init__(self, path, proj):
+        self.path, self.name = path, os.path.relpath(path, proj["root"])
+        self.line, self.loaded = 0, {}
+        self.watch = None          # memory watchdog, given to every coqtop started
+        self.configure(proj)
+
+    def configure(self, proj):
+        self.proj = proj
+        self.binds = bindings(proj["flags"], os.path.realpath(proj["root"]))
+        self.start_coqtop()
+
+    def start_coqtop(self):
+        p = self.proj
+        self.coq = Coqtop(p["cmd"], p["flags"], p["root"], p["env"])
+        self.coq.watch = self.watch
+        self.done, self.text, self.runs = [(0, self.coq.state)], "", []
+
+    def note_loaded(self):
+        out, _ = self.coq.send("Print Libraries.")
+        for p in products(out, self.binds):
+            if p not in self.loaded:
+                fp = fingerprint(p)
+                if fp is not None:
+                    self.loaded[p] = fp
+
+    def changed(self):
+        root = self.proj["root"]
+        return sorted(os.path.relpath(p, root) for p, fp in self.loaded.items()
+                      if fingerprint(p) != fp)
+
+    def restart(self, note, cmd):
+        """Restart coqtop; unless the request is itself a goto, replay the
+        file to the last goto line and the runs on top."""
+        runs = [text for _, text in self.runs]
+        self.coq.close()
+        self.loaded = {}
+        self.start_coqtop()
+        if cmd == "goto":
+            return note
+        out, failed = self.goto(self.line)
+        if failed:
+            return note + "; replaying %s stopped at an error:\n%s" % (self.name, out)
+        for text in runs:
+            out, err = self.run(text)
+            if err:
+                return note + "; replayed to line %s, but this run now fails: %s\n%s" % (
+                    self.line or "EOF", text, out)
+        return note + "; replayed to line %s%s" % (
+            self.line or "EOF", " and %d run(s)" % len(runs) if runs else "")
+
+    def before(self, cmd, proj):
+        """Before a request: pick up a new load path or rebuilt imports."""
+        if proj and any(proj[k] != self.proj[k] for k in ("flags", "cmd", "desc")):
+            self.coq.close()
+            self.loaded = {}
+            self.configure(proj)
+            return "rocq-live: the load path changed; restarted coqtop"
+        changed = self.changed()
+        if not changed:
+            return ""
+        shown = ", ".join(changed[:4]) + (" ..." if len(changed) > 4 else "")
+        return self.restart("rocq-live: %s changed since it was loaded; restarted coqtop" % shown, cmd)
+
+    def line_of(self, off):
+        return self.text.count("\n", 0, off) + 1
+
+    def goto(self, line):
+        with open(self.path, encoding="utf-8") as f:
+            new = f.read()
+        target = line_offset(new, line) if line else len(new)
+        self.line = line
+        d, m = 0, min(len(self.text), len(new))       # first changed character
+        while d < m and self.text[d] == new[d]:
+            d += 1
+        if d == m and len(self.text) == len(new):
+            d = len(new) + 1
+        keep = [e for e in self.done if e[0] == 0 or (e[0] < d and e[0] <= target)]
+        if keep != self.done or self.runs:
+            self.coq.back_to(keep[-1][1])
+        self.done, self.runs, self.text = keep, [], new
+        msgs, failed, off = [], False, self.done[-1][0]
+        while True:
+            end = next_sentence_end(new, off)
+            if end is None or end > target:
+                break
+            if only_blank(new[off:end]):
+                off = end; continue
+            out, err = self.coq.send(new[off:end])
+            if err:
+                at = self.line_of(off + len(new[off:end]) - len(new[off:end].lstrip()))
+                self.coq.back_to(self.done[-1][1])
+                failed = True
+                msgs.append("rocq-live: error in the sentence at %s line %d; stopped before it\n%s"
+                            % (self.name, at, out))
+                break
+            self.done.append((end, self.coq.state))
+            off = end
+        self.note_loaded()
+        stop = self.line_of(self.done[-1][0]) if self.done[-1][0] else 0
+        msgs.append(self.goals())
+        msgs.append("rocq-live: checked up to %s line %d (asked for line %s)"
+                    % (self.name, stop, line or "EOF"))
+        return "\n".join(msgs), failed
+
+    def run(self, text):
+        if not complete(text):
+            return "rocq-live: give complete sentences ending with '.'", True
+        before = self.coq.state
+        out, err = self.coq.send(text)
+        if err:
+            self.coq.back_to(before)
+            return out + "\nrocq-live: error; state unchanged", True
+        self.runs.append((before, text))
+        self.note_loaded()
+        return out or self.goals(), False
+
+    def query(self, text):
+        before = self.coq.state
+        out, err = self.coq.send(text)
+        self.coq.back_to(before)
+        return out, err
+
+    def back(self, n):
+        if n < 1 or n > len(self.runs):
+            return "rocq-live: %d run(s) to undo, asked %d" % (len(self.runs), n), True
+        state = self.runs[-n][0]
+        del self.runs[-n:]
+        self.coq.back_to(state)
+        return self.goals(), False
+
+    def goals(self):
+        out, err = self.coq.send("Show.")
+        return "(no open proof)" if err or not out else out
+
+    def try_(self, tactics, each_timeout):
+        """Run each tactic alone on the current state, then undo it: which
+        ones work, and what they leave. The state is unchanged."""
+        before, timeout, rows = self.coq.state, self.coq.timeout, []
+        for i, tac in enumerate(tactics, 1):
+            text = tac if complete(tac) else tac.rstrip() + "."
+            if not complete(text):
+                rows.append((i, tac, None, "not a complete sentence"))
+                continue
+            self.coq.timeout = min(each_timeout, timeout)
+            try:
+                out, err = self.coq.send(text)
+            finally:
+                self.coq.timeout = timeout
+            if not err and not out:
+                out = self.goals()
+            self.coq.back_to(before)
+            rows.append((i, tac, None if err else goal_count(out), out))
+        ok = [r for r in rows if r[2] is not None]
+        ok.sort(key=lambda r: r[2])
+        head = "rocq-live: %d of %d tactics work; state unchanged" % (len(ok), len(rows))
+        if ok:
+            head += "; best: [%d] %s (%s)" % (ok[0][0], ok[0][1], goals_word(ok[0][2]))
+        lines = [head]
+        for i, tac, n, out in rows:
+            if n is None:
+                lines.append("[%d] %s -> FAILS: %s" % (i, tac, error_text(out)))
+            else:
+                lines.append("[%d] %s -> works (%s)" % (i, tac, goals_word(n)))
+                if n and len(tactics) > 1:
+                    lines.append(indent(first_lines(out, 12)))
+                elif n:
+                    lines.append(indent(out))
+        return "\n".join(lines), not ok
+
+    def audit(self, names, allowed):
+        """Admitted/admit/axioms in the file, and `Print Assumptions` of its
+        declarations (or of `names`) against the allowed axioms. Checks the
+        whole file first; afterwards the session is back where it was."""
+        line, runs = self.line, [text for _, text in self.runs]
+        out, failed = self.goto(0)
+        if failed:
+            return ("rocq-live audit %s: FAIL (the file does not check)\n%s" % (self.name, out)), True
+        text = blank_comments(self.text)
+        static = scan_admits(text)
+        decls = names or declarations(text)
+        uses, unchecked = {}, []
+        for name in decls:
+            res, err = self.query("Print Assumptions %s." % name)
+            if err:
+                unchecked.append((name, error_text(res)))
+            else:
+                uses[name] = axioms_of(res)
+        bad, ok_used = {}, {}
+        for name, axs in uses.items():
+            for ax in axs:
+                (ok_used if axiom_allowed(ax, allowed) else bad).setdefault(ax, []).append(name)
+        # an axiom declared here is fine if allowed; an admit fails the audit
+        # unless only some NAMES were asked for (then their Print Assumptions
+        # decides: it lists every admitted lemma they depend on)
+        failing = [(ln, w) for ln, w in static
+                   if not (w.split()[0].rstrip("s") in ("Axiom", "Parameter", "Conjecture")
+                           and axiom_allowed(w.split()[1], allowed))]
+        if names:
+            failing = []
+        verdict = "FAIL" if (failing or bad or unchecked) else "PASS"
+        rep_ = ["rocq-live audit %s: %s" % (self.name, verdict)]
+        for ln, what in static:
+            tag = "" if (ln, what) in failing else (
+                "  (elsewhere in the file)" if names else "  (allowed)")
+            rep_.append("  line %d: %s%s" % (ln, what, tag))
+        for ax, who in sorted(bad.items()):
+            rep_.append("  axiom not allowed: %s  (used by %s)" % (ax, short_list(who)))
+        for ax, who in sorted(ok_used.items()):
+            rep_.append("  allowed axiom: %s  (used by %s)" % (ax, short_list(who)))
+        for name, e in unchecked:
+            rep_.append("  could not check %s: %s" % (name, e))
+        closed = sum(1 for axs in uses.values() if not axs)
+        rep_.append("  %d declaration(s) checked with Print Assumptions, %d closed; allowed axioms: %s"
+                    % (len(uses), closed, " ".join(allowed) or "(none: set `axioms` in .rocq-live)"))
+        # back to where the session was
+        back_out, back_failed = self.goto(line)
+        for t in runs:
+            o, e = self.run(t)
+            if e:
+                rep_.append("rocq-live: note: after the audit, this run no longer applies: %s" % t)
+                break
+        return "\n".join(rep_), verdict == "FAIL"
+
+
+# ---------------------------------------------------------- daemon
+
+def sock_path(path):
+    return os.path.join(SESSION_DIR, hashlib.sha1(path.encode()).hexdigest()[:12] + ".sock")
+
+
+def write_line(conn, obj):
+    conn.sendall((json.dumps(obj) + "\n").encode())
+
+
+_code = None
+
+
+def code_id():
+    """Hash of this script: a session started by another version is restarted."""
+    global _code
+    if _code is None:
+        with open(SELF, "rb") as f:
+            _code = hashlib.sha1(f.read()).hexdigest()[:12]
+    return _code
+
+
+def touch(path):
+    with open(path, "a"):
+        os.utime(path)
+
+
+def serve(path, sock, projfile):
+    """Daemon body: one request at a time, each a JSON line, answered with a
+    JSON line {out, err}. While a request runs, `.busy` exists (GC never stops
+    a busy session); `.used` is touched at each request (least recently used
+    sessions are stopped first)."""
+    with open(projfile) as f:
+        proj = json.load(f)
+    os.unlink(projfile)
+    srv = socket.socket(socket.AF_UNIX)
+    srv.bind(sock)
+    srv.listen(16)
+    for ext, val in ((".file", path), (".pid", str(os.getpid())), (".code", code_id())):
+        with open(sock + ext, "w") as f:
+            f.write(val)
+    touch(sock + ".used")
+    pgid = os.getpgid(0)
+    notes = []
+    floor = [0.0]     # memory just after the last restart: limits below it cannot be met
+    base = [0.0]      # memory when the current request began
+
+    def session_limit(lim):
+        return max(lim["session_mb"], floor[0] * 1.25)
+
+    def watch():
+        """While a step runs: over the per-session limit, interrupt it; over
+        the total, stop idle sessions (GC) and interrupt only if that is not
+        enough."""
+        lim, mem = limits(), group_mb()
+        own = mem.get(pgid, 0)
+        if own > session_limit(lim):
+            return ("this session uses %s, over the per-session limit %s (session_mb)"
+                    % (fmt_mb(own), fmt_mb(session_limit(lim))))
+        total = sum(m for g, m in mem.items() if g in session_groups())
+        if total > lim["max_mb"]:
+            notes.extend(gc(keep=sock))
+            mem = group_mb()
+            total = sum(m for g, m in mem.items() if g in session_groups())
+            # interrupt only a step that is itself growing: stopping a quiet
+            # one would not bring the total down
+            if total > lim["max_mb"] and own > base[0] + 64:
+                return ("the sessions use %s together, over the limit %s (max_mb), and no idle "
+                        "session is left to stop" % (fmt_mb(total), fmt_mb(lim["max_mb"])))
+        return None
+
+    session = None
+    try:
+        try:
+            session = Session(path, proj)     # requests wait in the backlog
+            session.watch = session.coq.watch = watch
+        except (StepTimeout, OSError, IndexError) as e:
+            boot_error = "rocq-live: coqtop did not start: %s" % e
+        else:
+            boot_error = None
+        while True:
+            r, _, _ = select.select([srv], [], [], limits()["idle"])
+            if not r:
+                break                          # idle too long
+            conn, _ = srv.accept()
+            with conn:
+                line = conn.makefile().readline()
+                if not line:
+                    continue                   # a liveness probe
+                if boot_error:
+                    write_line(conn, {"out": boot_error, "err": True})
+                    break
+                req = json.loads(line)
+                cmd, arg = req["cmd"], req.get("arg")
+                if cmd == "stop":
+                    write_line(conn, {"out": "rocq-live: session stopped", "err": False})
+                    break
+                touch(sock + ".busy"); touch(sock + ".used")
+                del notes[:]
+                base[0] = group_mb().get(pgid, 0)
+                try:
+                    session.coq.timeout, session.coq.why = TIMEOUT_GOTO, None
+                    note = session.before(cmd, req.get("proj"))
+                    session.coq.timeout = req.get("timeout", TIMEOUT_GOTO)
+                    if cmd == "goto":
+                        out, err = session.goto(arg)
+                        with open(sock + ".line", "w") as f:
+                            f.write(str(arg or 0))
+                    elif cmd == "run":
+                        out, err = session.run(arg)
+                    elif cmd == "query":
+                        out, err = session.query(arg)
+                    elif cmd == "back":
+                        out, err = session.back(arg)
+                    elif cmd == "goals":
+                        out, err = session.goals(), False
+                    elif cmd == "try":
+                        out, err = session.try_(arg["tactics"], arg["each_timeout"])
+                    elif cmd == "audit":
+                        out, err = session.audit(arg.get("names") or [],
+                                                 arg.get("allow") or session.proj.get("axioms") or [])
+                    else:
+                        out, err = "rocq-live: unknown command " + cmd, True
+                    # memory: a step that was stopped for memory, or a coqtop
+                    # still over the per-session limit, keeps its heap: restart
+                    # coqtop to give it back (the file is replayed)
+                    lim = limits()
+                    own = group_mb().get(pgid, 0)
+                    if session.coq.why or own > session_limit(lim):
+                        session.coq.why = None
+                        notes.append(session.restart(
+                            "rocq-live: this session used %s (per-session limit %s); restarted "
+                            "coqtop to free it" % (fmt_mb(own), fmt_mb(session_limit(lim))), "replay"))
+                        floor[0] = group_mb().get(pgid, 0)
+                        if floor[0] > lim["session_mb"]:
+                            notes.append("rocq-live: even freshly started, this file needs %s, more "
+                                         "than session_mb %s; using %s as its limit (raise session_mb)"
+                                         % (fmt_mb(floor[0]), fmt_mb(lim["session_mb"]),
+                                            fmt_mb(session_limit(lim))))
+                    notes.extend(gc(keep=sock))
+                except StepTimeout as e:
+                    if session.coq.p.poll() is None:      # coqtop hangs: give up
+                        write_line(conn, {"out": "rocq-live: session lost: %s" % e, "err": True})
+                        break
+                    # coqtop died during the step (a crash in Rocq): start it
+                    # again where the session was; the step is not applied
+                    try:
+                        session.coq.timeout = TIMEOUT_GOTO
+                        what = ("did not stop when interrupted (%s); killed it" % (session.coq.why or "too slow")
+                                if "did not respond" in str(e) else
+                                "died during this step (exit %s)" % session.coq.p.returncode)
+                        session.coq.why = None
+                        note2 = session.restart("rocq-live: coqtop %s; restarted it" % what, "replay")
+                    except StepTimeout as e2:
+                        write_line(conn, {"out": "rocq-live: session lost: %s\n%s" % (e, e2), "err": True})
+                        break
+                    out, err = ("%s\nrocq-live: the step was not applied" % note2 if "did not respond" in str(e)
+                                else "%s\n%s\nrocq-live: the step was not applied" % (str(e)[:4000], note2)), True
+                    note = ""
+                finally:
+                    try:
+                        os.unlink(sock + ".busy")
+                    except OSError:
+                        pass
+                    touch(sock + ".used")
+                if note:
+                    out = note + "\n" + out
+                if notes:
+                    out = out + "\n" + "\n".join(notes)
+                write_line(conn, {"out": out, "err": err})
+    finally:
+        if session:
+            session.coq.close()
+        srv.close()
+        for ext in SUFFIXES:
+            try:
+                os.unlink(sock + ext)
+            except OSError:
+                pass
+
+
+# ---------------------------------------------------------- client API
+# Each returns (text, error?). Used by the CLI and by the MCP server.
+
+def norm(file):
+    path = os.path.realpath(os.path.abspath(os.path.expanduser(file)))
+    if not path.endswith(".v") or not os.path.isfile(path):
+        raise Fail("rocq-live: no such .v file: " + file)
+    return path
+
+
+def alive(sock):
+    try:
+        c = socket.socket(socket.AF_UNIX)
+        c.connect(sock)
+        c.close()
+        return True
+    except OSError:
+        return False
+
+
+SUFFIXES = ("", ".file", ".pid", ".busy", ".used", ".proj", ".code", ".line")
+
+
+def kill_session(sock):
+    """Kill the daemon's process group (daemon and coqtop) at once: a stop
+    request would wait behind a step that is still running."""
+    try:
+        os.killpg(int(open(sock + ".pid").read()), signal.SIGKILL)
+    except (OSError, ValueError):
+        pass
+    for ext in SUFFIXES:
+        try:
+            os.unlink(sock + ext)
+        except OSError:
+            pass
+
+
+def mtime(path, default=0.0):
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return default
+
+
+def sweep():
+    """Live sessions, least recently used first, as dicts {sock, file, pid,
+    busy, used, mb}; on the way, remove what dead sessions left behind (a
+    file younger than a minute may belong to a session still starting)."""
+    if not os.path.isdir(SESSION_DIR):
+        return []
+    now, live = time.time(), []
+    socks = {os.path.join(SESSION_DIR, n[:n.index(".sock") + 5])
+             for n in os.listdir(SESSION_DIR) if ".sock" in n}
+    mem = None
+    for sock in sorted(socks):
+        if alive(sock):
+            if mem is None:
+                mem = group_mb()
+            try:
+                pid = int(open(sock + ".pid").read())
+                name = open(sock + ".file").read()
+            except (OSError, ValueError):
+                continue
+            live.append({"sock": sock, "file": name, "pid": pid, "busy": os.path.exists(sock + ".busy"),
+                         "used": mtime(sock + ".used", mtime(sock + ".file")), "mb": mem.get(pid, 0)})
+            continue
+        for ext in SUFFIXES:
+            if now - mtime(sock + ext, now) > 60:
+                try:
+                    os.unlink(sock + ext)
+                except OSError:
+                    pass
+        if now - mtime(sock + ".log", now) > LOG_KEEP:
+            try:
+                os.unlink(sock + ".log")
+            except OSError:
+                pass
+    live.sort(key=lambda x: x["used"])
+    return live
+
+
+def session_groups():
+    """Process groups of the live sessions (their daemons' pids)."""
+    out = set()
+    if os.path.isdir(SESSION_DIR):
+        for n in os.listdir(SESSION_DIR):
+            if n.endswith(".sock.pid"):
+                try:
+                    out.add(int(open(os.path.join(SESSION_DIR, n)).read()))
+                except (OSError, ValueError):
+                    pass
+    return out
+
+
+def gc(keep=None, adding=0):
+    """Enforce the limits: stop least recently used idle sessions while they
+    use more than max_mb together, or while there are more than max_sessions
+    (counting `adding` sessions about to start). For the count only, a session
+    used in the last `grace` seconds is spared: an agent between two tool
+    calls looks idle but will be back, and stopping it costs a full re-check,
+    while an extra idle coqtop costs only memory (which max_mb bounds). Never
+    stops `keep` or a busy session. Returns a note per stopped session."""
+    lim, live, notes, now = limits(), sweep(), [], time.time()
+    count, total = len(live) + adding, sum(x["mb"] for x in live)
+    for x in live:                       # least recently used first
+        if x["sock"] == keep or x["busy"]:
+            continue
+        if total > lim["max_mb"]:
+            why = "sessions used %s together, limit %s (max_mb)" % (fmt_mb(total), fmt_mb(lim["max_mb"]))
+        elif count > lim["max_sessions"]:
+            if now - x["used"] < lim["grace"]:
+                continue                 # used recently: its agent is likely coming back
+            why = "more than %d sessions (max_sessions)" % lim["max_sessions"]
+        else:
+            break
+        kill_session(x["sock"])
+        count, total = count - 1, total - x["mb"]
+        notes.append("rocq-live: gc stopped the least recently used session %s (%s): %s"
+                     % (x["file"], fmt_mb(x["mb"]), why))
+    return notes
+
+
+def upgraded(sock):
+    """True if the session runs another version of this script."""
+    try:
+        return open(sock + ".code").read() != code_id()
+    except OSError:
+        return True
+
+
+def request(sock, cmd, arg=None, proj=None):
+    default = TIMEOUT_GOTO if cmd == "goto" else TIMEOUT_STEP
+    timeout = float(os.environ.get("ROCQ_LIVE_TIMEOUT", default))
+    c = socket.socket(socket.AF_UNIX)
+    c.connect(sock)
+    msg = {"cmd": cmd, "arg": arg, "timeout": timeout}
+    if proj:
+        msg["proj"] = proj
+    c.sendall((json.dumps(msg) + "\n").encode())
+    line = c.makefile().readline()
+    c.close()
+    if not line:
+        return "rocq-live: the session ended; its log: %s.log" % sock, True
+    resp = json.loads(line)
+    return resp["out"], resp["err"]
+
+
+def describe(path, proj):
+    return "rocq-live: %s: %s, load path from %s (root %s)" % (
+        os.path.basename(path), proj["desc"], proj["kind"], proj["root"])
+
+
+def start(file, line=0):
+    path = norm(file)
+    proj = resolve(path)
+    sock = sock_path(path)
+    kill_session(sock)
+    os.makedirs(SESSION_DIR, exist_ok=True)
+    notes = gc(adding=1)
+    projfile = sock + ".proj"
+    with open(projfile, "w") as f:
+        json.dump(proj, f)
+    log = open(sock + ".log", "w")
+    subprocess.Popen([sys.executable, "-I", SELF, "_serve", path, sock, projfile],
+                     stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                     start_new_session=True, cwd=proj["root"])
+    for _ in range(200):
+        if alive(sock):
+            break
+        time.sleep(0.05)
+    else:
+        return "rocq-live: session did not start; see %s.log" % sock, True
+    out, err = request(sock, "goto", line)
+    return "\n".join(notes + [describe(path, proj), out]), err
+
+
+def goto(file, line=0):
+    path = norm(file)
+    sock = sock_path(path)
+    if not alive(sock) or upgraded(sock):
+        return start(file, line)
+    proj = resolve(path)              # rebuild imports; maybe a new load path
+    return request(sock, "goto", line, proj)
+
+
+def _live(file):
+    path = norm(file)
+    sock = sock_path(path)
+    if not alive(sock):
+        raise Fail("rocq-live: no session for %s; start one with: rocq-live goto %s LINE"
+                   % (file, file))
+    if upgraded(sock):
+        # rocq-live itself was updated: restart the session where it was
+        try:
+            line = int(open(sock + ".line").read())
+        except (OSError, ValueError):
+            line = 0
+        out, err = start(file, line)
+        if not alive(sock):
+            raise Fail(out)
+        _upgrade_notes.append("rocq-live: rocq-live was updated; restarted the session at %s "
+                              "line %s (runs made on top of it are gone)" % (file, line or "EOF"))
+    return sock
+
+
+_upgrade_notes = []
+
+
+def run(file, text):
+    return request(_live(file), "run", text)
+
+
+def query(file, text):
+    return request(_live(file), "query", text)
+
+
+def back(file, n=1):
+    return request(_live(file), "back", int(n))
+
+
+def goals(file):
+    return request(_live(file), "goals")
+
+
+def try_(file, tactics):
+    if not tactics:
+        raise Fail("rocq-live: give at least one tactic to try")
+    each = float(os.environ.get("ROCQ_LIVE_TRY_TIMEOUT", "30"))
+    return request(_live(file), "try", {"tactics": list(tactics), "each_timeout": each})
+
+
+def audit(file, names=None, allow=None):
+    path = norm(file)
+    sock = sock_path(path)
+    if not alive(sock):
+        out, err = start(file, 0)
+        if not alive(sock):
+            return out, True
+    proj = resolve(path)
+    return request(sock, "audit", {"names": names or [], "allow": allow or []}, proj)
+
+
+def stop(file):
+    if file in ("--all", "all"):
+        live = sweep()
+        for x in live:
+            kill_session(x["sock"])
+        return "rocq-live: stopped %d session(s)" % len(live), False
+    # no existence check: the file of a session may have been deleted
+    kill_session(sock_path(os.path.realpath(os.path.abspath(os.path.expanduser(file)))))
+    return "rocq-live: session stopped", False
+
+
+def sessions():
+    """Live sessions with their memory and idle time, and the limits."""
+    live, lim, now = sweep(), limits(), time.time()
+    rows = []
+    for x in reversed(live):              # most recently used first
+        idle = now - x["used"]
+        rows.append("%-8s %-8s %s%s" % (fmt_mb(x["mb"]),
+                    "busy" if x["busy"] else "%dm idle" % (idle // 60) if idle >= 60 else "%ds idle" % idle,
+                    x["file"], ""))
+    total = sum(x["mb"] for x in live)
+    rows.append("%d session(s), %s; limits: %d sessions (sparing those used in the last %dm), "
+                "%s total, %s per session, %dm idle"
+                % (len(live), fmt_mb(total), lim["max_sessions"], lim["grace"] // 60,
+                   fmt_mb(lim["max_mb"]), fmt_mb(lim["session_mb"]), lim["idle"] // 60))
+    return "\n".join(rows), False
+
+
+def collect():
+    notes = gc()
+    return "\n".join(notes) or "rocq-live: gc: nothing to stop (within the limits)", False
+
+
+def info(file):
+    path = norm(file)
+    proj = resolve(path, build=False)
+    v = subprocess.run(proj["cmd"] + ["--version"], env=proj["env"], capture_output=True, text=True)
+    flags = " ".join(shlex.quote(f) for f in proj["flags"])
+    return ("root:      %s\nload path: %s\ntoolchain: %s (%s: %s)\nflags:     %s\nsession:   %s"
+            % (proj["root"], proj["kind"], proj["desc"], " ".join(proj["cmd"]),
+               (v.stdout.strip().splitlines() or ["?"])[0], flags or "(none)",
+               "running" if alive(sock_path(path)) else "none")), False
+
+
+HINTS = [
+    (r"Cannot\s+find\s+a\s+physical\s+path\s+bound\s+to\s+logical\s+path\s+(\S+?)(?:\s+with\s+prefix\s+(\S+?))?\.?\s*$",
+     lambda m: "no load-path binding covers %s. `rocq-live info FILE` shows the flags in use; add a "
+     "-Q/-R for it (_CoqProject, the dune theory's `theories`, or `flags` in .rocq-live)"
+     % ((m.group(2) + "." if m.group(2) else "") + m.group(1))),
+    (r"Unable\s+to\s+locate\s+library\s+(\S+?)\.?\s*$",
+     lambda m: "%s is not on the load path or not built yet. `rocq-live info FILE` shows the flags; "
+     "build the library (or set `build` in .rocq-live)" % m.group(1)),
+    (r"bad\s+version\s+number|compiled\s+with\s+another\s+version|incompatible\s+version",
+     lambda m: "a .vo was built by a different Rocq than the coqtop in use. `rocq-live info FILE` "
+     "shows the toolchain; use the one that built it (`switch` in .rocq-live, ROCQ_LIVE_SWITCH) or rebuild"),
+    (r"Compiled\s+library\s+(\S+)\s+\(in\s+file[^)]*\)\s+makes\s+inconsistent\s+assumptions\s+over\s+library\s+(\S+)",
+     lambda m: ("a .vo was built by a different Rocq/stdlib than the coqtop in use; check the toolchain "
+                "(`rocq-live info FILE`) or rebuild"
+                if re.match(r"(Corelib|Coq|Stdlib)\.", m.group(2)) else
+                "%s is stale: it was compiled against an older %s. Rebuild %s (and what depends on it)"
+                % (m.group(1), m.group(2), m.group(1)))),
+    (r"step interrupted after \d+ s",
+     lambda m: "the step ran too long (a diverging or very slow tactic). Try a cheaper tactic, or "
+     "raise ROCQ_LIVE_TIMEOUT if it is really needed"),
+    (r"over the per-session limit|over the limit \S+ \S+ \(max_mb\)",
+     lambda m: "the step used too much memory; tactics that split goals repeatedly (destruct in a "
+     "repeat, case analysis) can build huge goal trees: close branches as they appear"),
+    (r"This command requires an open proof|No focused proof",
+     lambda m: "no proof is open at this point: `goto` a line inside a proof first"),
+]
+
+
+def explain(out):
+    """Plain-language hints for errors whose fix is not in the message."""
+    hints = []
+    for pat, msg in HINTS:
+        m = re.search(pat, out, re.M)
+        if m:
+            h = "rocq-live hint: " + msg(m)
+            if h not in hints:
+                hints.append(h)
+    return hints
+
+
+def safe(fn, *args):
+    try:
+        out, err = fn(*args)
+    except Fail as e:
+        out, err = str(e), True
+    except (OSError, subprocess.SubprocessError, ValueError) as e:
+        out, err = "rocq-live: %s: %s" % (type(e).__name__, e), True
+    if _upgrade_notes:
+        out = "\n".join(_upgrade_notes + [out])
+        del _upgrade_notes[:]
+    if err:
+        out = "\n".join([out] + explain(out))
+    return out, err
+
+
+# ---------------------------------------------------------- MCP server
+
+LINE_DOC = ("1-based line: the state just before this line (put it on the first "
+            "line of a tactic, not inside one). Omit or 0 for the end of the file.")
+FILE_DOC = "Path to the .v file (absolute, or relative to the server's directory)."
+
+TOOLS = [
+    ("rocq_goto", "Show the Rocq proof state just before LINE of FILE, in a live coqtop "
+     "session (started on first use; the project's root, load path and toolchain are found "
+     "automatically, and FILE's imports are rebuilt). Later calls re-check only from the "
+     "first character changed in FILE, so the loop is: edit the file, rocq_goto, repeat. "
+     "Reports the first error before LINE, if any.",
+     {"file": ("string", FILE_DOC), "line": ("integer", LINE_DOC),
+      "fresh": ("boolean", "Kill any running session for FILE and start a new one.")},
+     ["file"]),
+    ("rocq_run", "Run tactics/commands (complete sentences ending in '.') on top of the "
+     "session's current state and return the new goals or the error. An error leaves the "
+     "state unchanged. Use to try tactics without editing the file; rocq_back undoes.",
+     {"file": ("string", FILE_DOC), "text": ("string", "Sentences, e.g. 'intros x. simpl.'")},
+     ["file", "text"]),
+    ("rocq_query", "Run a command, return its output, then undo it: Search, Check, Print, "
+     "About, Locate, Print Assumptions, Compute ...",
+     {"file": ("string", FILE_DOC), "text": ("string", "e.g. 'Search (_ + 0 = _).'")},
+     ["file", "text"]),
+    ("rocq_try", "Try several tactics, each alone, on the session's current state and report "
+     "which work and how many goals each leaves (best first); the state is unchanged. Use it "
+     "instead of guessing one tactic at a time; then rocq_run the winner.",
+     {"file": ("string", FILE_DOC),
+      "tactics": ("array", "Tactics, e.g. [\"lia\", \"auto\", \"reflexivity\"] (a final '.' is added if missing)")},
+     ["file", "tactics"]),
+    ("rocq_audit", "Check FILE for unfinished or assumed proofs: Admitted/admit/give_up, "
+     "Axiom/Parameter declarations, and `Print Assumptions` of every declaration (or of NAMES) "
+     "against the allowed axioms (`axioms` in .rocq-live, or ALLOW). PASS/FAIL with lines and names. "
+     "Checks the whole file; the session returns to where it was.",
+     {"file": ("string", FILE_DOC),
+      "names": ("array", "Only these declarations (qualified if inside a Module)."),
+      "allow": ("array", "Allowed axiom names, overriding the project's `axioms`.")},
+     ["file"]),
+    ("rocq_back", "Undo the last N rocq_run calls (default 1) and show the goals.",
+     {"file": ("string", FILE_DOC), "n": ("integer", "How many runs to undo.")}, ["file"]),
+    ("rocq_goals", "Show the current goals of FILE's session.",
+     {"file": ("string", FILE_DOC)}, ["file"]),
+    ("rocq_stop", "Stop FILE's session (kills coqtop at once), or every session with all=true.",
+     {"file": ("string", FILE_DOC), "all": ("boolean", "Stop every session.")}, []),
+    ("rocq_sessions", "List the running sessions with their memory and idle time, and the "
+     "limits (sessions beyond them are stopped automatically, least recently used first).", {}, []),
+    ("rocq_info", "Show how FILE's project is set up: root, toolchain, load path flags.",
+     {"file": ("string", FILE_DOC)}, ["file"]),
+]
+
+
+def tool_list():
+    out = []
+    for name, desc, props, req in TOOLS:
+        # hints for clients' approval rules: no tool edits source files (a
+        # goto may build the project's imports, as a build would)
+        out.append({"name": name, "description": desc,
+                    "annotations": {"readOnlyHint": True, "destructiveHint": False,
+                                    "idempotentHint": name in ("rocq_goals", "rocq_sessions", "rocq_info", "rocq_try"),
+                                    "openWorldHint": False},
+                    "inputSchema": {
+            "type": "object", "required": req,
+            "properties": {k: dict({"type": t, "description": d},
+                                   **({"items": {"type": "string"}} if t == "array" else {}))
+                           for k, (t, d) in props.items()}}})
+    return out
+
+
+def call_tool(name, a):
+    f = a.get("file", "")
+    if name == "rocq_goto":
+        return safe(start if a.get("fresh") else goto, f, int(a.get("line") or 0))
+    if name == "rocq_run":
+        return safe(run, f, a.get("text", ""))
+    if name == "rocq_query":
+        return safe(query, f, a.get("text", ""))
+    if name == "rocq_try":
+        tacs = a.get("tactics") or []
+        return safe(try_, f, [tacs] if isinstance(tacs, str) else tacs)
+    if name == "rocq_audit":
+        return safe(audit, f, a.get("names") or [], a.get("allow") or [])
+    if name == "rocq_back":
+        return safe(back, f, int(a.get("n") or 1))
+    if name == "rocq_goals":
+        return safe(goals, f)
+    if name == "rocq_stop":
+        return safe(stop, "--all" if a.get("all") else f)
+    if name == "rocq_sessions":
+        return safe(sessions)
+    if name == "rocq_info":
+        return safe(info, f)
+    return "unknown tool " + name, True
+
+
+def mcp():
+    """MCP over stdio: newline-delimited JSON-RPC 2.0. Calls run in threads
+    (a session serialises its own requests), so one slow goto does not block
+    work on another file."""
+    lock = threading.Lock()
+
+    def send(obj):
+        with lock:
+            sys.stdout.write(json.dumps(obj) + "\n")
+            sys.stdout.flush()
+
+    def handle(msg):
+        mid, method, params = msg.get("id"), msg.get("method"), msg.get("params") or {}
+        if mid is None:
+            return                                # a notification
+        if method == "initialize":
+            result = {"protocolVersion": params.get("protocolVersion", "2025-06-18"),
+                      "capabilities": {"tools": {}},
+                      "serverInfo": {"name": "rocq-live", "version": VERSION},
+                      "instructions": "Live Rocq proof sessions. Use rocq_goto to see the "
+                      "goal at a line (edit the file, then rocq_goto again: only the change "
+                      "is re-checked), rocq_run/rocq_back to try tactics, rocq_query for "
+                      "Search/Check/Print."}
+        elif method == "tools/list":
+            result = {"tools": tool_list()}
+        elif method == "tools/call":
+            text, err = call_tool(params.get("name"), params.get("arguments") or {})
+            result = {"content": [{"type": "text", "text": text}], "isError": bool(err)}
+        elif method == "ping":
+            result = {}
+        else:
+            send({"jsonrpc": "2.0", "id": mid,
+                  "error": {"code": -32601, "message": "method not found: %s" % method}})
+            return
+        send({"jsonrpc": "2.0", "id": mid, "result": result})
+
+    last = {}
+
+    def ordered(msg, prev, done):
+        for ev in prev:
+            ev.wait()
+        try:
+            handle(msg)
+        finally:
+            done.set()
+
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+        except ValueError:
+            send({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "parse error"}})
+            continue
+        # calls on one file run in arrival order (each waits for the previous
+        # one on that file); calls on other files run in parallel
+        f = ((msg.get("params") or {}).get("arguments") or {}).get("file")
+        key = os.path.realpath(os.path.expanduser(f)) if isinstance(f, str) and f else None
+        # a call without a file (sessions, stop all) waits for every earlier call
+        done = threading.Event()
+        prev = [last[key]] if key in last else []
+        if key is None:
+            prev = list(last.values())
+        if key and "*" in last:
+            prev.append(last["*"])
+        last[key or "*"] = done
+        threading.Thread(target=ordered, args=(msg, prev, done), daemon=True).start()
+    return 0
+
+
+# ---------------------------------------------------------- CLI
+
+def split_file_line(args):
+    """FILE:LINE or FILE [LINE]."""
+    f, rest = args[0], args[1:]
+    m = re.match(r"^(.*\.v):(\d+)$", f)
+    if m:
+        return m.group(1), int(m.group(2)), rest
+    if rest and rest[0].isdigit():
+        return f, int(rest[0]), rest[1:]
+    return f, 0, rest
+
+
+def main(argv):
+    if os.environ.get(ECHO_ENV):                  # we are dune's --toplevel
+        print(ECHO_TAG + json.dumps(argv))
+        return 0
+    if argv[:1] == ["_serve"] and len(argv) == 4:
+        serve(argv[1], argv[2], argv[3]); return 0
+    usage = __doc__.split("\n\n")[1]
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__); return 0
+    cmd, args = argv[0], argv[1:]
+    if cmd == "mcp":
+        return mcp()
+    if cmd in ("list", "sessions"):
+        out, err = safe(sessions)
+    elif cmd == "gc":
+        out, err = safe(collect)
+    elif cmd == "try" and len(args) >= 2:
+        out, err = safe(try_, args[0], args[1:])
+    elif cmd == "audit" and args:
+        names, allow, rest = [], [], args[1:]
+        while rest:
+            if rest[0] == "--allow" and len(rest) > 1:
+                allow += rest[1].replace(",", " ").split(); rest = rest[2:]
+            else:
+                names.append(rest[0]); rest = rest[1:]
+        out, err = safe(audit, args[0], names, allow)
+    elif cmd in ("start", "goto") and args:
+        f, line, rest = split_file_line(args)
+        if rest:
+            print(usage, file=sys.stderr); return 2
+        out, err = safe(start if cmd == "start" else goto, f, line)
+    elif cmd in ("run", "query") and len(args) == 2:
+        out, err = safe(run if cmd == "run" else query, args[0], args[1])
+    elif cmd == "back" and len(args) in (1, 2):
+        out, err = safe(back, args[0], int(args[1]) if len(args) == 2 else 1)
+    elif cmd in ("goals", "stop", "info") and len(args) == 1:
+        out, err = safe({"goals": goals, "stop": stop, "info": info}[cmd], args[0])
+    elif cmd == "--version":
+        out, err = "rocq-live " + VERSION, False
+    else:
+        print(usage, file=sys.stderr); return 2
+    print(out)
+    return 1 if err else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

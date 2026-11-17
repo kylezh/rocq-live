@@ -1,0 +1,7 @@
+__pycache__/
+*.vo
+*.vos
+*.vok
+*.glob
+.*.aux
+_build/
