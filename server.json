@@ -3,7 +3,7 @@
   "name": "io.github.kylezh/rocq-live",
   "title": "rocq-live",
   "description": "Live Rocq (Coq) proof sessions for coding agents: goals, tactics, audits; no per-project setup",
-  "version": "0.1.0",
+  "version": "0.0.0+dev",
   "repository": {
     "url": "https://github.com/kylezh/rocq-live",
     "source": "github"
@@ -13,7 +13,7 @@
     {
       "registryType": "pypi",
       "identifier": "rocq-live",
-      "version": "0.1.0",
+      "version": "0.0.0+dev",
       "runtimeHint": "uvx",
       "transport": {
         "type": "stdio"

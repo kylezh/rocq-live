@@ -1,0 +1,66 @@
+name: Release
+
+# The version is written in one place: the tag. Push `vX.Y.Z` and this
+# workflow writes X.Y.Z into the script and server.json, builds and checks the
+# package, then publishes it to PyPI (Trusted Publishing, no token), to the MCP
+# Registry (GitHub OIDC), and as a GitHub release with the single-file script
+# attached.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write   # create the GitHub release
+  id-token: write   # PyPI Trusted Publishing and the MCP Registry login
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    environment: pypi
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
+
+      - name: Version from the tag
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          echo "$v" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+((a|b|rc)[0-9]+)?$' \
+            || { echo "::error::tag $GITHUB_REF_NAME is not vX.Y.Z"; exit 1; }
+          echo "VERSION=$v" >> "$GITHUB_ENV"
+
+      - name: Write the version into the script and server.json
+        run: |
+          sed -i "s/^VERSION = \"0\.0\.0+dev\"/VERSION = \"$VERSION\"/" rocq-live
+          grep -q "^VERSION = \"$VERSION\"" rocq-live
+          jq --arg v "$VERSION" '.version = $v | .packages[].version = $v' server.json > server.json.new
+          mv server.json.new server.json
+
+      - name: Build
+        run: uv build
+
+      - name: Check the wheel (CLI and MCP handshake; no Rocq on the runner)
+        run: |
+          whl="dist/rocq_live-$VERSION-py3-none-any.whl"
+          uvx --from "$whl" rocq-live --version | grep -qx "rocq-live $VERSION"
+          printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}' \
+            | uvx --from "$whl" rocq-live mcp | grep -q "\"version\": \"$VERSION\""
+
+      - name: Publish to PyPI
+        run: uv publish
+
+      - name: Publish to the MCP Registry
+        run: |
+          curl -fsSL https://github.com/modelcontextprotocol/registry/releases/download/v1.8.9/mcp-publisher_linux_amd64.tar.gz \
+            | tar xz mcp-publisher
+          ./mcp-publisher login github-oidc
+          # the registry checks the PyPI package, which can take a moment to appear
+          for attempt in 1 2 3 4 5; do
+            ./mcp-publisher publish && exit 0
+            echo "attempt $attempt failed; retrying in 30 s"; sleep 30
+          done
+          exit 1
+
+      - name: GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" rocq-live dist/* --title "rocq-live $VERSION" --generate-notes

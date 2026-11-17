@@ -35,7 +35,7 @@ uv tool install rocq-live            # or: pipx install rocq-live
 Or run it without installing (`uvx rocq-live …`), or take the single file:
 
 ```sh
-curl -fsSL -o ~/.local/bin/rocq-live https://raw.githubusercontent.com/kylezh/rocq-live/master/rocq-live
+curl -fsSL -o ~/.local/bin/rocq-live https://github.com/kylezh/rocq-live/releases/latest/download/rocq-live
 chmod +x ~/.local/bin/rocq-live      # any directory on PATH works
 ```
 
@@ -326,6 +326,27 @@ that runs too long is interrupted (SIGINT) and undone. Sessions live under
 python3 tests/test_rocq_live.py                     # default toolchain
 ROCQ_LIVE_SWITCH=path python3 tests/test_rocq_live.py
 ```
+
+## Releasing
+
+The version is written in one place: the git tag. To release X.Y.Z:
+
+```sh
+git tag vX.Y.Z && git push origin vX.Y.Z
+```
+
+The [Release workflow](https://github.com/kylezh/rocq-live/blob/master/.github/workflows/release.yml) then:
+- writes X.Y.Z into the script and `server.json`;
+- builds the package and checks the wheel's CLI and MCP handshake;
+- publishes to PyPI (Trusted Publishing, no token) and to the MCP Registry;
+- creates a GitHub release with the single-file script attached.
+
+An untagged checkout reports version `0.0.0+dev`, which PyPI refuses, so a
+local build can't be uploaded by mistake.
+
+One-time setup: on PyPI, add a trusted publisher to the `rocq-live` project
+(owner `kylezh`, repository `rocq-live`, workflow `release.yml`, environment
+`pypi`), and create a GitHub environment named `pypi` in the repository.
 
 ## Related
 

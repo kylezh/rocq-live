@@ -90,7 +90,7 @@ import sys
 import threading
 import time
 
-VERSION = "0.1.0"
+VERSION = "0.0.0+dev"        # the release workflow writes the tag's version here
 SELF = os.path.abspath(__file__)
 SESSION_DIR = "/tmp/rocq-live-%d" % os.getuid()   # short: AF_UNIX paths <= 104
 TIMEOUT_GOTO = 600          # replaying a long prefix can be slow
