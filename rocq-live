@@ -18,6 +18,16 @@
                                       which work, goals left; state unchanged
   rocq-live audit FILE [NAME..] [--allow AX,..]  Admitted/admit/axioms and
                                       Print Assumptions vs the allowed axioms
+  rocq-live check FILE [--allow-stale] [--rebuild]  coqc's verdict on the whole
+                                      file (errors in coqc's format, exit 0 OK, 1
+                                      error, 2 not checked), from the live session:
+                                      re-checks only what an edit can affect (a
+                                      Qed proof's tactics: that proof; a statement,
+                                      definition or instance: the proofs that can
+                                      see it). Refuses
+                                      (exit 2) if a dependency's .vo is out of date
+  rocq-live compile FILE [--deps-only] write .vo files with the project's build
+                                      step: out-of-date dependencies, then FILE
   rocq-live back  FILE [N]            undo the last N runs (default 1)
   rocq-live goals FILE                print the current goals
   rocq-live start FILE [LINE]         like goto, but always a fresh session
@@ -42,6 +52,9 @@ switch if it has coqtop, else coqtop on PATH.
   flags    -Q theories My         load path flags, verbatim
   loadpath scripts/loadpath.sh {file}   command printing the flags; may build
   build    make -j8 vos           command run before each start/goto
+  compile  make {vo}              how `compile` builds one file ({file}: the .v,
+                                  {vo}: its .vo relative to the root); default:
+                                  coqc with the load path, or dune build
   axioms   classic functional_extensionality_dep   axioms `audit` accepts
 
 Limits (machine-wide; environment, else ~/.config/rocq-live/config with the
@@ -62,6 +75,7 @@ Environment: ROCQ_LIVE_FLAGS (load path override), ROCQ_LIVE_SWITCH,
 ROCQ_LIVE_TIMEOUT (seconds per step; default 600 for goto/start, 120 others),
 ROCQ_LIVE_TRY_TIMEOUT (seconds per tactic in `try`; default 30),
 ROCQ_LIVE_FAST=0 (goto checks every proof, as --full),
+ROCQ_LIVE_REUSE=0 (after an edit inside a proof, re-run every proof after it),
 ROCQ_LIVE_DAEMON=0 (no background process: each call starts coqtop, rebuilds
 the state from the recipe and exits; slower per call, nothing left running).
 
@@ -256,6 +270,9 @@ def find_up(start, names):
         d = parent
 
 
+CONFIG_KEYS = ("switch", "flags", "loadpath", "build", "compile", "axioms")
+
+
 def read_config(path):
     cfg = {}
     with open(path, encoding="utf-8") as f:
@@ -264,9 +281,8 @@ def read_config(path):
             if not line or line.startswith("#"):
                 continue
             key, _, val = line.partition(" ")
-            if key not in ("switch", "flags", "loadpath", "build", "axioms"):
-                raise Fail("rocq-live: %s: unknown key %r (switch, flags, loadpath, build, axioms)"
-                           % (path, key))
+            if key not in CONFIG_KEYS:
+                raise Fail("rocq-live: %s: unknown key %r (%s)" % (path, key, ", ".join(CONFIG_KEYS)))
             cfg[key] = val.strip()
     return cfg
 
@@ -427,7 +443,8 @@ def resolve(path, build=True):
         else:
             out.append(flags[i]); i += 1
     return {"root": root, "kind": kind, "flags": out, "env": env, "desc": desc,
-            "cmd": toplevel_cmd(env), "axioms": cfg.get("axioms", "").split()}
+            "cmd": toplevel_cmd(env), "axioms": cfg.get("axioms", "").split(),
+            "compile": cfg.get("compile")}
 
 
 # ------------------------------------------------------------ coqtop driver
@@ -616,28 +633,47 @@ def short_list(names, n=5):
     return ", ".join(names[:n]) + (" and %d more" % (len(names) - n) if len(names) > n else "")
 
 
+_OPEN_OR_QUOTE = re.compile(r'\(\*|"')
+_OPEN_OR_CLOSE = re.compile(r"\(\*|\*\)")
+_NOT_NEWLINE = re.compile(r"[^\n]")
+
+
 def blank_comments(text):
     """`text` with comments and strings replaced by spaces (newlines kept), so
-    offsets and line numbers still match the file."""
-    out, i, depth, n = list(text), 0, 0, len(text)
-    while i < n:
-        if text.startswith("(*", i):
-            depth += 1; out[i] = out[i + 1] = " "; i += 2; continue
-        if depth:
-            if text.startswith("*)", i):
-                depth -= 1; out[i] = out[i + 1] = " "; i += 2; continue
-            if text[i] != "\n":
-                out[i] = " "
-            i += 1; continue
-        if text[i] == '"':
-            j = i + 1
-            while j < n and not (text[j] == '"' and not text.startswith('""', j)):
-                j += 2 if text.startswith('""', j) else 1
-            for k in range(i, min(j + 1, n)):
-                if out[k] != "\n":
-                    out[k] = " "
-            i = j + 1; continue
-        i += 1
+    offsets and line numbers still match the file. Comments nest; inside a
+    string, "" is an escaped quote."""
+    out, pos, depth, n = [], 0, 0, len(text)
+    while pos < n:
+        if not depth:
+            m = _OPEN_OR_QUOTE.search(text, pos)
+            if not m:
+                out.append(text[pos:])
+                break
+            out.append(text[pos:m.start()])
+            if m.group() == "(*":
+                out.append("  ")
+                depth, pos = 1, m.end()
+                continue
+            j = m.end()                      # a string: find its closing quote
+            while True:
+                k = text.find('"', j)
+                if k < 0:
+                    k = n
+                    break
+                if text.startswith('""', k):
+                    j = k + 2
+                    continue
+                break
+            out.append(_NOT_NEWLINE.sub(" ", text[m.start():k + 1]))
+            pos = k + 1
+        else:
+            m = _OPEN_OR_CLOSE.search(text, pos)
+            if not m:
+                out.append(_NOT_NEWLINE.sub(" ", text[pos:]))
+                break
+            out.append(_NOT_NEWLINE.sub(" ", text[pos:m.start()]) + "  ")
+            depth += 1 if m.group() == "(*" else -1
+            pos = m.end()
     return "".join(out)
 
 
@@ -747,18 +783,21 @@ def section_depths(blank):
         off = end
 
 
-def skippable(new, blank, off, end, target, edit, depths):
-    """If the sentence new[off:end] opens a finished opaque proof that ends
-    before `target`, does not overlap the edited region `edit` and can be
-    replaced by Admitted without changing what follows, return (offsets of a
-    `Proof using` sentence or None, end of the proof's Qed/Admitted)."""
+def proof_extent(text, blank, off, end):
+    """If the sentence text[off:end] opens an opaque proof (a theorem-like
+    statement without `:=`, closed by Qed or Admitted, not Program, not
+    `Proof term.`, no nested proof), its parts: {"using": offsets of a `Proof
+    using` sentence or None, "body": where the tactics start, "sents":
+    offsets of the tactic sentences, "last": start of the Qed/Admitted
+    sentence, "stop": its end, "section_ok": True unless Admitted would
+    generalize it differently over Section variables}, else None."""
     t = norm_sentence(blank, off, end)
     m = STMT.match(t)
     if not m or ":=" in t or re.search(r"\bProgram\b", t.split(m.group(1))[0]):
         return None
-    using, p, first = None, end, True
+    using, body, sents, p, first = None, end, [], end, True
     while True:
-        e2 = next_sentence_end(new, p)
+        e2 = next_sentence_end(text, p)
         if e2 is None:
             return None
         u = norm_sentence(blank, p, e2)
@@ -770,18 +809,640 @@ def skippable(new, blank, off, end, target, edit, depths):
                 using = (p, e2)
             elif not re.match(r"^Proof\s*(with\b.*)?\.$", u):
                 return None              # `Proof term.` ends the proof by itself
+            body = e2
         elif re.match(r"^(Qed|Admitted)\s*\.$", u):
-            stop = e2
-            break
+            return {"using": using, "body": body, "sents": sents, "last": p, "stop": e2,
+                    "using_in_stmt": "using" in t.split(m.group(1))[0]}
         elif re.match(r"^(Defined|Abort|Save)\b", u) or (STMT.match(u) and ":=" not in u):
             return None                  # transparent, aborted, or a nested proof
+        else:
+            sents.append((p, e2))
         first = False
         p = e2
+
+
+def skippable(new, blank, off, end, target, edit, depths):
+    """If the sentence new[off:end] opens a finished opaque proof that ends
+    before `target`, does not overlap the edited region `edit` and can be
+    replaced by Admitted without changing what follows, return (offsets of a
+    `Proof using` sentence or None, end of the proof's Qed/Admitted)."""
+    ext = proof_extent(new, blank, off, end)
+    if not ext:
+        return None
+    stop = ext["stop"]
     if stop > target or (off < edit[1] and stop > edit[0]):
         return None
-    if depths.get(off, 0) and not (using or "using" in t.split(m.group(1))[0]):
+    if depths.get(off, 0) and not (ext["using"] or ext["using_in_stmt"]):
         return None    # in a Section, Admitted would generalize differently without `Proof using`
-    return using, stop
+    return ext["using"], stop
+
+
+def cosmetic_pairs(old, new, start, old_end, new_end):
+    """If `old` and `new` hold the same sentences from the boundary `start`
+    on, differing only in the comments and white space before them, and the
+    texts agree again from old_end/new_end, {old sentence end: new sentence
+    end} for the sentences up to there; else None."""
+    delta = len(new) - len(old)
+    po = pn = start
+    pairs = {}
+    while not (po >= old_end and pn >= new_end and pn - po == delta):
+        eo, en = next_sentence_end(old, po), next_sentence_end(new, pn)
+        if eo is None or en is None:
+            if eo is None and en is None and only_blank(old[po:]) and only_blank(new[pn:]):
+                return pairs
+            return None
+        if sentence_core(old[po:eo]) != sentence_core(new[pn:en]):
+            return None
+        pairs[eo] = en
+        po, pn = eo, en
+    return pairs
+
+
+def statement_before(blank, bounds):
+    """(start, end) of the nearest theorem-like statement before the
+    boundary bounds[-1], walking back over the sentences between `bounds`;
+    None if a sentence that closes a proof or opens/closes a block comes
+    first. (A caller checks that the boundary is inside that proof.)"""
+    for i in range(len(bounds) - 1, max(0, len(bounds) - 5000), -1):
+        a, b = bounds[i - 1], bounds[i]
+        u = norm_sentence(blank, a, b)
+        if STMT.match(u) and ":=" not in u:
+            return a, b
+        if re.match(r"^(Qed|Admitted|Defined|Abort|Save|End|Section|Module)\b", u):
+            return None
+    return None
+
+
+def parse_item(text, blank, off):
+    """The top-level item starting at the boundary `off`: a proof (from its
+    statement to its Qed/Admitted/Defined/Abort/Save) or a single sentence.
+    {"end", "head": the first sentence normalized, "proof": bool, "closer",
+    "sents": tactic sentences of a proof, "ext": proof_extent or None};
+    None if the text ends inside it."""
+    e = next_sentence_end(text, off)
+    if e is None:
+        return None
+    u = norm_sentence(blank, off, e)
+    if not (STMT.match(u) and ":=" not in u):
+        return {"start": off, "end": e, "head": u, "proof": False}
+    p, sents = e, []
+    while True:
+        e2 = next_sentence_end(text, p)
+        if e2 is None:
+            return None
+        w = norm_sentence(blank, p, e2)
+        m = re.match(r"^(Qed|Admitted|Defined|Abort|Save)\b", w)
+        if m:
+            return {"start": off, "end": e2, "head": u, "proof": True, "closer": m.group(1),
+                    "sents": sents, "ext": proof_extent(text, blank, off, e)}
+        if STMT.match(w) and ":=" not in w:
+            return None                                  # a nested proof
+        if w and not (not sents and re.match(r"^Proof\b", w)):
+            sents.append((p, e2))
+        p = e2
+
+
+def instance_class(head):
+    """C in `Instance name binders : C args ...`, or None."""
+    m = re.match(r"^(?:#\[[^\]]*\]\s*)?(?:(?:Local|Global|Polymorphic|Monomorphic)\s+)*"
+                 r"Instance\s+[^\W\d][\w']*", head)
+    if not m:
+        return None
+    depth, i = 0, m.end()
+    while i < len(head):
+        c = head[i]
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+        elif depth == 0 and head.startswith(":=", i):
+            return None
+        elif depth == 0 and c == ":":
+            t = IDENT.search(head, i + 1)
+            return t.group() if t else None
+        i += 1
+    return None
+
+
+CLASS_DECL = re.compile(r"^(?:#\[[^\]]*\]\s*)?(?:(?:Local|Global|Polymorphic|Monomorphic|Cumulative|"
+                        r"NonCumulative)\s+)*(Class|Existing\s+Class)\s+([^\W\d][\w']*)")
+
+
+def class_members(head):
+    """Names a Class sentence declares besides the class: its methods and
+    constructor (a single-method class `Class C := m : T.` too)."""
+    out = set(re.findall(r"(?:\{|;)\s*([^\W\d][\w']*)\s*(?::>|::|:)", head))
+    out |= set(re.findall(r":=\s*([^\W\d][\w']*)\s*(?::(?!=)|\{)", head))
+    return out
+
+
+def edit_effect(old, new, d, k, bounds):
+    """What the change [d, len - k) means for the proofs after it. Returns
+    (start, old end, new end, names, walk start) of the edited top-level
+    items, or
+    None if anything after the change may be affected:
+    - an edit to the tactics of one self-contained opaque proof: no names
+      (what follows a Qed sees only its statement);
+    - otherwise the names the edited items declare (old and new): proofs
+      (statement changed, transparent, or in a Section without `Proof
+      using`), definitions, Fixpoints, Ltacs. Queries declare nothing.
+    - an Instance: also its class and the class's methods, provided the class
+      is declared in this file; the walk then starts at the class, since
+      code before the edit (generic in the class) can reach the instance
+      through typeclass search.
+    Anything else (Inductive, Notation, Hint, Section, Module, Program, ...)
+    gives None. `bounds`: sentence boundaries up to d (from 0)."""
+    bo, bn = blank_comments(old), blank_comments(new)
+    bounds = list(bounds)
+    p = bounds[-1]
+    while True:                      # the rest of the boundaries up to d
+        e = next_sentence_end(old, p)
+        if e is None or e > d:
+            break
+        bounds.append(e)
+        p = e
+    start = bounds[-1]               # the item holding d: a sentence, or a proof around it
+    st = statement_before(bo, bounds)
+    if st:
+        it = parse_item(old, bo, st[0])
+        if it and it["proof"] and it["end"] > start:
+            start = st[0]
+    delta, oe, ne = len(new) - len(old), len(old) - k, len(new) - k
+    olds, news, po, pn = [], [], start, start
+    while po < oe or pn < ne or pn - po != delta:
+        if po < oe or pn - po > delta:
+            it = parse_item(old, bo, po)
+            if it is None:
+                if only_blank(old[po:]) and po < len(old):
+                    po = len(old)
+                    continue
+                return None
+            olds.append(it)
+            po = it["end"]
+        else:
+            it = parse_item(new, bn, pn)
+            if it is None:
+                if only_blank(new[pn:]) and pn < len(new):
+                    pn = len(new)
+                    continue
+                return None
+            news.append(it)
+            pn = it["end"]
+    # items that did not change at the end (an insertion before them)
+    while olds and news and news[-1]["start"] - olds[-1]["start"] == delta and \
+            sentence_core(old[olds[-1]["start"]:olds[-1]["end"]]) == \
+            sentence_core(new[news[-1]["start"]:news[-1]["end"]]):
+        po, pn = olds[-1]["start"], news[-1]["start"]
+        olds.pop()
+        news.pop()
+    if len(olds) == 1 and len(news) == 1 and olds[0]["proof"] and news[0]["proof"]:
+        xo, xn = olds[0]["ext"], news[0]["ext"]
+        if xo and xn and self_contained(bo, xo["sents"]) and self_contained(bn, xn["sents"]) \
+                and old[start:xo["body"]] == new[start:xn["body"]] \
+                and (xo["using"] or xo["using_in_stmt"] or not section_depths(bo).get(start, 0)):
+            return start, po, pn, set(), pn              # tactics only
+    names, walk = set(), pn
+    for it, text, blank in [(i, old, bo) for i in olds] + [(i, new, bn) for i in news]:
+        head = it["head"]
+        if it["proof"]:
+            if not self_contained(blank, it["sents"]) or it["closer"] == "Save":
+                return None
+            if it["closer"] == "Abort":
+                continue
+        else:
+            v = head
+            while WRAPPER.match(v):
+                v = WRAPPER.sub("", v, count=1)
+            if QUERY.match(v):
+                continue
+            head = v
+        kind, name = declared(head)
+        if kind == "Goal":
+            continue
+        if not name or not kind or (it["proof"] is False and kind not in (
+                "Definition", "Fixpoint", "CoFixpoint", "Let", "Example", "Ltac", "Instance") and
+                ":=" not in head):
+            return None
+        if kind in ("Fixpoint", "CoFixpoint"):
+            names |= set(re.findall(r"\bwith\s+([^\W\d][\w']*)", head))   # mutual ones
+        elif re.search(r"\bwith\b", head) and it["proof"]:
+            return None
+        names.add(name)
+        if kind == "Instance":
+            cls = instance_class(head)
+            decl = None
+            for i in range(1, len(bounds)):
+                if bounds[i] > start:
+                    break
+                m = CLASS_DECL.match(norm_sentence(bo, bounds[i - 1], bounds[i]))
+                if m and m.group(2) == cls:
+                    decl = (bounds[i - 1], bounds[i], norm_sentence(bo, bounds[i - 1], bounds[i]))
+            if decl is None:
+                return None                              # a class from elsewhere
+            names |= {cls} | class_members(decl[2])
+            walk = min(walk, decl[1])
+    return start, po, pn, names, walk
+
+
+NAMED = re.compile(r"^(?:#\[[^\]]*\]\s*)?(?:(?:Local|Global|Polymorphic|Monomorphic|Cumulative|"
+                   r"NonCumulative)\s+)*(Theorem|Lemma|Corollary|Proposition|Fact|Remark|Example|"
+                   r"Property|Definition|Fixpoint|CoFixpoint|Let|Instance|Ltac|Goal)\b\s*([^\W\d][\w']*)?")
+IDENT = re.compile(r"[^\W\d][\w']*")
+# a sentence that changes nothing later proofs could see
+QUERY = re.compile(r"^(Check|Print|About|Locate|Search\w*|Compute|Eval|Fail|Succeed|Show|Test|Pwd)\b")
+WRAPPER = re.compile(r"^(?:Time|Timeout\s+\d+|Redirect\s+\S+|Instructions|Profile)\s+")
+# tactics that search the whole environment for lemmas, so they can use one
+# without naming it (CoqHammer, Tactician)
+SEARCHING_TACTICS = {"hammer", "hhammer", "predict", "synth", "suggest"}
+
+
+def declared(head):
+    """(keyword, name) of a sentence that declares a name, or (None, None)."""
+    m = NAMED.match(head)
+    if not m:
+        return None, None
+    return m.group(1), (None if m.group(1) == "Goal" else m.group(2))
+
+
+def affected_proofs(text, blank, start, names, skip=None):
+    """After a change to what `names` denote, walk the rest of `text` from
+    `start` without running it: the (start, end) of each proof that may
+    check differently, or None if the change reaches something later proofs
+    can use without naming it (a Hint, an Instance, a Notation, Arguments, a
+    module command, ...). A proof that mentions an affected name is
+    affected; a definition, a transparent proof, a proof statement, an Ltac
+    or (in a Section without `Proof using`) any proof that mentions one
+    adds its own name. An Instance of a class among `names` adds its name
+    too: typeclass search for that class is already accounted for. `skip`:
+    (start, end) of text not to walk (the edited items)."""
+    names, affected, depths, off = set(names), set(), section_depths(blank), start
+
+    def mentions(a, b):
+        return any(t in names for t in IDENT.findall(blank[a:b]))
+    while True:
+        if skip and skip[0] <= off < skip[1]:
+            off = skip[1]
+        end = next_sentence_end(text, off)
+        if end is None:
+            return affected
+        u = norm_sentence(blank, off, end)
+        if not u:
+            off = end
+            continue
+        if STMT.match(u) and ":=" not in u:               # a proof: find where it ends
+            p, closer = end, None
+            while True:
+                e2 = next_sentence_end(text, p)
+                if e2 is None:
+                    return affected                       # unfinished: nothing after it
+                w = norm_sentence(blank, p, e2)
+                if re.match(r"^(Qed|Admitted|Defined|Abort|Save)\b", w):
+                    closer = w.split()[0].rstrip(".")
+                    break
+                if STMT.match(w) and ":=" not in w:
+                    return None                           # a nested proof: give up
+                p = e2
+            stop = e2
+            tokens = set(IDENT.findall(blank[off:stop]))
+            if tokens & names or tokens & SEARCHING_TACTICS:
+                affected.add((off, stop))
+                ext = proof_extent(text, blank, off, end)
+                if ext and not self_contained(blank, ext["sents"]):
+                    return None
+                if closer == "Save" or re.search(r"\bwith\b", u):
+                    return None
+                auto_vars = depths.get(off, 0) and not (ext and (ext["using"] or ext["using_in_stmt"]))
+                if closer != "Abort" and (mentions(off, end) or not ext or auto_vars):
+                    kind, name = declared(u)
+                    if (kind == "Instance" and instance_class(u) not in names) or (kind != "Goal" and not name):
+                        return None
+                    if name:
+                        names.add(name)
+            off = stop
+            continue
+        if mentions(off, end):                            # any other sentence
+            v = u
+            while WRAPPER.match(v):
+                v = WRAPPER.sub("", v, count=1)
+            kind, name = declared(v)
+            if QUERY.match(v):
+                pass
+            elif name and kind != "Goal" and not re.search(r"\bwith\b", v) and (
+                    kind != "Instance" or instance_class(v) in names):
+                names.add(name)
+            else:
+                return None
+        off = end
+
+
+# Commands that may appear inside a proof without changing anything after it.
+# Any other capitalized sentence in a proof (Set, Hint, Ltac, Opaque, ...)
+# could, so a proof containing one is not treated as self-contained.
+HARMLESS_IN_PROOF = re.compile(
+    r"^(Show|Check|Search\w*|About|Print|Locate|Compute|Eval|Fail|Succeed|Time|Timeout|Info|"
+    r"Guarded|Focus|Unfocus|Unshelve|Optimize|Undo|Restart)\b")
+
+
+def self_contained(blank, sents):
+    """True if a proof's tactic sentences cannot affect anything after its
+    Qed: no vernacular command that changes global state, and no `abstract`
+    (it declares constants that later sentences could name)."""
+    for a, b in sents:
+        u = norm_sentence(blank, a, b)
+        if re.search(r"\b(abstract|transparent_abstract)\b", u):
+            return False
+        if re.match(r"^[A-Z#]", u) and not HARMLESS_IN_PROOF.match(u):
+            return False
+    return True
+
+
+def sentence_core(chunk):
+    """A sentence as sent (leading blanks and comments included) without its
+    leading blanks and comments."""
+    blank = blank_comments(chunk)
+    return chunk[len(blank) - len(blank.lstrip()):]
+
+
+# ------------------------------------------------- check (coqc's verdict)
+
+def count_sentences(text):
+    n, off = 0, 0
+    while True:
+        end = next_sentence_end(text, off)
+        if end is None:
+            return n
+        if not only_blank(text[off:end]):
+            n += 1
+        off = end
+
+
+def block_kinds(blank):
+    """{name: "section" | "module" | "module type"} of the blocks opened in
+    the file (comments blanked), for coqc's message about unclosed ones."""
+    kinds, off = {}, 0
+    while True:
+        end = next_sentence_end(blank, off)
+        if end is None:
+            return kinds
+        t = norm_sentence(blank, off, end)
+        m = re.match(r"^(Section|Module\s+Type|Module)\s+(?:(?:Import|Export)\s+)?([\w']+)", t)
+        if m and ":=" not in t:
+            kinds[m.group(2)] = ("section" if m.group(1) == "Section" else
+                                 "module" if m.group(1) == "Module" else "module type")
+        off = end
+
+
+LOCATION = re.compile(r"Toplevel input, characters (\d+)-(\d+):")
+
+
+def coqc_diag(text, error, name):
+    """The error of a failed sentence as coqc prints it: `File "NAME", line
+    L, characters A-B:` then the message. coqtop reports byte offsets into the
+    sentence as it was sent (one sentence per send); coqc counts bytes from
+    the start of the line where the error starts. An error without a location
+    gets the sentence's own, as in coqc."""
+    start, sent, out = error
+    k = ERROR.search(out)
+    msg = out[k.start():].rstrip() if k else out.strip()
+    locs = list(LOCATION.finditer(out, 0, k.start() if k else len(out)))
+    if locs:
+        a, b = int(locs[-1].group(1)), int(locs[-1].group(2))
+    else:
+        blank = blank_comments(sent)
+        lead = len(blank) - len(blank.lstrip())
+        a, b = len(sent[:lead].encode()), len(sent.encode())
+    data = text.encode()
+    base = len(text[:start].encode())
+    A, B = min(base + a, len(data)), min(base + b, len(data))
+    bol = data.rfind(b"\n", 0, A) + 1
+    return 'File "%s", line %d, characters %d-%d:\n%s' % (
+        name, data.count(b"\n", 0, A) + 1, A - bol, B - bol, msg)
+
+
+def coqc_name(file):
+    """The file name as coqc prints it: as given, with ./ before a relative
+    path that does not start with ./ or ../ (OCaml's Filename.is_implicit)."""
+    explicit = os.path.isabs(file) or file.startswith(("./", "../"))
+    return file if explicit else "./" + file
+
+
+# ------------------------------------------------- out-of-date dependencies
+
+DEP_DIR = os.path.join(os.path.dirname(RECIPE_DIR), "deps")
+REQUIRES = re.compile(r"\b(?:From|Require|Load|Declare)\b[\s\S]*?\.(?=\s|$)")
+
+
+def dep_tool(env):
+    if shutil.which("coqdep", path=env.get("PATH")):
+        return ["coqdep"]
+    if shutil.which("rocq", path=env.get("PATH")):
+        return ["rocq", "dep"]
+    return None
+
+
+def project_sources(proj):
+    """The .v files under the project's own -Q/-R directories."""
+    seen, out = set(), []
+    for _, d in bindings(proj["flags"], os.path.realpath(proj["root"])):
+        for dp, dns, fns in os.walk(d):
+            dns[:] = sorted(n for n in dns if not n.startswith(".") and n != "_build")
+            for fn in sorted(fns):
+                if fn.endswith(".v"):
+                    p = os.path.realpath(os.path.join(dp, fn))
+                    if p not in seen:
+                        seen.add(p)
+                        out.append(p)
+    return out
+
+
+def dep_graph(proj, path):
+    """{.v: [.v it requires]} over the project's own files, from coqdep.
+    Cached on disk; coqdep re-runs only for files whose Require lines
+    changed, or for all when files were added or removed (that can change
+    how names resolve). None if there is no coqdep."""
+    tool = dep_tool(proj["env"])
+    if not tool:
+        return None
+    files = project_sources(proj)
+    if path not in files:
+        files.append(path)
+    lp, i, fl = [], 0, proj["flags"]
+    while i < len(fl):
+        if fl[i] in ("-Q", "-R") and i + 2 < len(fl):
+            lp += fl[i:i + 3]; i += 3
+        elif fl[i] == "-I" and i + 1 < len(fl):
+            lp += fl[i:i + 2]; i += 2
+        else:
+            i += 1
+    key = hashlib.sha1(json.dumps([proj["root"], lp, tool]).encode()).hexdigest()[:12]
+    cache_file = os.path.join(DEP_DIR, key + ".json")
+    try:
+        with open(cache_file) as f:
+            cache = json.load(f)
+    except (OSError, ValueError):
+        cache = {}
+    new, todo = {}, []
+    for f in files:
+        st = os.stat(f)
+        stamp = [st.st_mtime_ns, st.st_size]
+        old = cache.get(f)
+        if old and old[:2] == stamp:
+            new[f] = old
+            continue
+        with open(f, encoding="utf-8", errors="replace") as h:
+            req = hashlib.sha1("\n".join(REQUIRES.findall(h.read())).encode()).hexdigest()
+        if old and old[2] == req:
+            new[f] = stamp + [req, old[3]]
+        else:
+            new[f] = stamp + [req, None]
+            todo.append(f)
+    if set(cache) != set(files):
+        todo = files                  # a file came or went: names may resolve differently
+    found = {}
+    for k in range(0, len(todo), 400):
+        r = subprocess.run(tool + lp + todo[k:k + 400], cwd=proj["root"], env=proj["env"],
+                           capture_output=True, text=True)
+        for line in r.stdout.splitlines():
+            lhs, sep, rhs = line.partition(": ")
+            toks = rhs.split()
+            if not sep or ".required_vo" not in lhs or not toks:
+                continue
+            src = os.path.realpath(os.path.join(proj["root"], toks[0]))
+            found[src] = [os.path.realpath(os.path.join(proj["root"], t))[:-1]
+                          for t in toks[1:] if t.endswith(".vo")]
+    known = set(files)
+    for f in todo:
+        new[f][3] = [d for d in found.get(f, []) if d in known]
+    if new != cache:
+        try:
+            os.makedirs(DEP_DIR, exist_ok=True)
+            tmp = cache_file + ".tmp%d" % os.getpid()
+            with open(tmp, "w") as h:
+                json.dump(new, h)
+            os.replace(tmp, cache_file)
+        except OSError:
+            pass
+    return {f: v[3] or [] for f, v in new.items()}
+
+
+def built_ns(v):
+    """When the .v's library was last built (its .vo, or a non-empty .vos
+    from a `make vos` build, whichever is newer), or None."""
+    t = None
+    for ext in (".vo", ".vos"):
+        try:
+            st = os.stat(v[:-2] + ext)
+        except OSError:
+            continue
+        if ext == ".vo" or st.st_size:
+            t = max(t or 0, st.st_mtime_ns)
+    return t
+
+
+def stale_deps(path, proj):
+    """[(.v, why)] of the libraries FILE requires (transitively) that make
+    would rebuild: no .vo, a .vo older than its .v, or older than a .vo it
+    requires; in build order. [] for dune projects (resolve just built them)
+    or when it cannot be told (no coqdep)."""
+    if proj["kind"] == "dune":
+        return []
+    try:
+        graph = dep_graph(proj, path)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return []
+    if not graph:
+        return []
+    order, seen, root = [], set(), proj["root"]
+    stack = [(d, False) for d in reversed(graph.get(path, []))]
+    while stack:                       # post-order: dependencies first
+        v, expanded = stack.pop()
+        if expanded:
+            order.append(v)
+            continue
+        if v in seen or v == path:
+            continue
+        seen.add(v)
+        stack.append((v, True))
+        stack.extend((d, False) for d in reversed(graph.get(v, [])) if d not in seen)
+    why = {}
+    for v in order:
+        rel, t = os.path.relpath(v, root), built_ns(v)
+        if t is None:
+            why[v] = "%s has no .vo" % rel
+        elif os.stat(v).st_mtime_ns > t:
+            why[v] = "%s is newer than its .vo" % rel
+        else:
+            for d in graph.get(v, []):
+                if why.get(d):
+                    why[v] = "%s requires %s, which is out of date" % (rel, os.path.relpath(d, root))
+                    break
+                td = built_ns(d)
+                if td and td > t:
+                    why[v] = "%s's .vo is older than %s's, which it requires" % (rel, os.path.relpath(d, root))
+                    break
+    return [(v, why[v]) for v in order if why.get(v)]
+
+
+def stale_list(stale, n=8):
+    return "\n".join(["  " + w for _, w in stale[:n]] +
+                     (["  ... and %d more" % (len(stale) - n)] if len(stale) > n else []))
+
+
+def stale_note(path, proj):
+    """A warning for goto: the session loads .vo files older than their
+    sources, so edits in those files are not seen."""
+    try:
+        stale = stale_deps(path, proj)
+    except Exception:              # a warning must never break goto
+        return ""
+    if not stale:
+        return ""
+    return ("rocq-live: warning: %d of this file's dependencies %s out of date, so the session uses "
+            "their old .vo:\n%s\nrocq-live: rebuild with `rocq-live compile FILE --deps-only` (MCP: "
+            "rocq_compile, deps_only) to use your edits; the session then reloads them"
+            % (len(stale), "is" if len(stale) == 1 else "are", stale_list(stale)))
+
+
+def compile_cmd(proj, v):
+    """(command, shell?, cwd) that builds v's .vo as the project does."""
+    root = proj["root"]
+    if proj.get("compile"):
+        vo = os.path.relpath(v[:-2] + ".vo", root)
+        return (proj["compile"].replace("{file}", shlex.quote(v)).replace("{vo}", shlex.quote(vo)),
+                True, root)
+    if proj["kind"] == "dune":
+        return (["dune", "build", "--display=quiet", os.path.basename(v)[:-2] + ".vo"],
+                False, os.path.dirname(v))
+    if proj["kind"] == ".rocq-live loadpath":
+        raise Fail("rocq-live: the load path comes from a `loadpath` command, so where .vo files go "
+                   "is up to your build; set `compile` in .rocq-live (e.g. `compile make {vo}`)")
+    env = proj["env"]
+    tool = (["coqc"] if shutil.which("coqc", path=env.get("PATH")) else
+            ["rocq", "compile"] if shutil.which("rocq", path=env.get("PATH")) else None)
+    if not tool:
+        raise Fail("rocq-live: no coqc (or rocq) found to compile with")
+    return tool + proj["flags"] + [v], False, root
+
+
+def build(path, proj, deps_only):
+    """Compile FILE's out-of-date dependencies in order, then FILE unless
+    deps_only. (text, error?)"""
+    root, done, t0 = proj["root"], [], time.time()
+    todo = [] if proj["kind"] == "dune" else [v for v, _ in stale_deps(path, proj)]
+    if not deps_only:
+        todo.append(path)
+    for v in todo:
+        cmd, shell, cwd = compile_cmd(proj, v)
+        r = subprocess.run(cmd, shell=shell, cwd=cwd, env=proj["env"], capture_output=True, text=True)
+        if r.returncode:
+            return ("%s%s\nrocq-live: compiling %s failed (exit %d)%s"
+                    % (r.stdout, r.stderr, os.path.relpath(v, root), r.returncode,
+                       "; compiled before it: " + ", ".join(done) if done else "")), True
+        done.append(os.path.relpath(v, root))
+    if not done:
+        return ("rocq-live: dependencies up to date (dune builds them)" if proj["kind"] == "dune"
+                else "rocq-live: dependencies up to date"), False
+    return "rocq-live: compiled %s (%.1f s)" % (", ".join(done), time.time() - t0), False
 
 
 # ------------------------------------------------- recipes
@@ -823,27 +1484,32 @@ def drop_recipe(path):
 
 class Session:
     """The file's checked prefix: `done` lists (end offset, coqtop state) of
-    each sentence checked, `text` the file as last read, `runs` stacks
-    (state before, text) of each run, `line` the last goto target, `loaded`
-    the fingerprint of each watched product when it was loaded."""
+    each sentence checked, `text` the file as last read (the offsets refer to
+    it), `runs` stacks (state before, text) of each run, `line` the last goto
+    target, `loaded` the fingerprint of each watched product when it was
+    loaded. `checked` holds (statement start, proof end) of each opaque proof
+    known to check in `text` with the same imports: it outlives a coqtop
+    restart, and such a proof is not re-run unless something it can depend
+    on changes. `skipped` lists (statement end, proof end, checked?) of the
+    proofs the current coqtop holds as Admitted."""
 
     def __init__(self, path, proj):
         self.path, self.name = path, os.path.relpath(path, proj["root"])
-        self.line, self.loaded = 0, {}
+        self.line, self.loaded, self.text = 0, {}, ""
         self.watch = None          # memory watchdog, given to every coqtop started
         self.configure(proj)
 
     def configure(self, proj):
         self.proj = proj
         self.binds = bindings(proj["flags"], os.path.realpath(proj["root"]))
+        self.checked = set()       # another load path: nothing is known to check
         self.start_coqtop()
 
     def start_coqtop(self):
         p = self.proj
         self.coq = Coqtop(p["cmd"], p["flags"], p["root"], p["env"])
         self.coq.watch = self.watch
-        self.done, self.text, self.runs = [(0, self.coq.state)], "", []
-        self.skipped = []          # (body start, proof end) of proofs taken as Admitted
+        self.done, self.runs, self.skipped = [(0, self.coq.state)], [], []
 
     def note_loaded(self):
         out, _ = self.coq.send("Print Libraries.")
@@ -889,22 +1555,28 @@ class Session:
         if not changed:
             return ""
         shown = ", ".join(changed[:4]) + (" ..." if len(changed) > 4 else "")
+        self.checked = set()           # proofs may now check differently
         return self.restart("rocq-live: %s changed since it was loaded; restarted coqtop" % shown, cmd)
 
     def line_of(self, off):
         return self.text.count("\n", 0, off) + 1
 
-    def goto(self, line, full=False):
+    def goto(self, line, full=False, strict=False):
         """State just before `line` (0: end of file). Re-checks from the first
-        changed character. Unless `full`, a finished Qed proof before the
-        target that was not edited is taken as Admitted (its statement is
-        checked, its tactics are not), as `coqc -vos` does: everything else in
-        the file (imports, scopes, notations, options) is replayed as usual."""
+        changed character, except what the change cannot affect:
+        - an edit to comments or white space between sentences re-runs nothing;
+        - a proof already checked (see `checked`) is taken as Admitted, its
+          statement re-checked: an edit inside one self-contained Qed proof
+          keeps the proofs after it checked, since what follows a Qed sees
+          only the statement.
+        Unless `full`, a finished Qed proof before the target that was not
+        edited is taken as Admitted as well (statement checked, tactics not),
+        as `coqc -vos` does. `strict` (audit) runs every proof for real."""
         with open(self.path, encoding="utf-8") as f:
             new = f.read()
         target = line_offset(new, line) if line else len(new)
         self.line = line
-        full = full or not line          # the whole file: check every proof
+        full = full or strict or not line          # the whole file: check every proof
         old = self.text
         d, m = 0, min(len(old), len(new))       # first changed character
         while d < m and old[d] == new[d]:
@@ -919,51 +1591,81 @@ class Session:
             while k < m - d and old[len(old) - 1 - k] == new[len(new) - 1 - k]:
                 k += 1
             edit = (d, max(len(new) - k, d + 1))
+            if self.carry_over(old, new, d, k):     # comments/white space only
+                d, edit = len(new) + 1, (len(new) + 1, len(new) + 1)
         if full:          # re-check proofs taken as Admitted before the target
-            for body, stop in self.skipped:
-                if body < target:
+            for body, stop, known in self.skipped:
+                if body < target and (strict or not known):
                     d = min(d, body)
                     break
         keep = [e for e in self.done if e[0] == 0 or (e[0] < d and e[0] <= target)]
         if keep != self.done or self.runs:
             self.coq.back_to(keep[-1][1])
         self.done, self.runs, self.text = keep, [], new
-        self.skipped = [(b, e) for b, e in self.skipped if e <= keep[-1][0]]
+        self.skipped = [x for x in self.skipped if x[1] <= keep[-1][0]]
         fast = not full and fast_enabled()
-        blank = blank_comments(new) if fast else None
-        depths = section_depths(blank) if fast else {}
+        reuse = not strict and bool(self.checked) and os.environ.get("ROCQ_LIVE_REUSE", "1") != "0"
+        blank = depths = None
         msgs, failed, off, skipped_now = [], False, self.done[-1][0], 0
+        self.error, self.sent, self.reused = None, 0, 0   # error: (start offset, text sent, output)
+        opening = None                    # (statement start, proof end) of the proof being run
+        if off and off < target:          # resuming inside a proof? it counts once its Qed runs
+            blank = blank_comments(new)
+            depths = section_depths(blank) if fast or reuse else {}
+            st = statement_before(blank, [e for e, _ in self.done])
+            ext = proof_extent(new, blank, *st) if st else None
+            if ext and st[1] <= off < ext["stop"]:
+                opening = (st[0], ext["stop"])
         while True:
             end = next_sentence_end(new, off)
             if end is None or end > target:
                 break
             if only_blank(new[off:end]):
                 off = end; continue
-            blk = skippable(new, blank, off, end, target, edit, depths) if fast else None
+            if blank is None:
+                blank = blank_comments(new)
+                depths = section_depths(blank) if fast or reuse else {}
+            blk, known = None, False
+            if fast or reuse:
+                blk = skippable(new, blank, off, end, target, edit, depths)
+                known = bool(blk) and reuse and (off, blk[1]) in self.checked
+                if blk and not (fast or known):
+                    blk = None
             if blk:
                 using, stop = blk
-                parts = [(new[off:end], end)]
+                parts = [(new[off:end], off, end)]
                 if using:
-                    parts.append((new[using[0]:using[1]], using[1]))
-                parts.append(("Admitted.", stop))
+                    parts.append((new[using[0]:using[1]], using[0], using[1]))
+                parts.append(("Admitted.", stop, stop))
                 bad = None
-                for text, at_end in parts:
+                for text, at_start, at_end in parts:
                     out, err = self.coq.send(text)
+                    self.sent += 1
                     if err:
-                        bad = out
+                        bad = (at_start, text, out)
                         break
                     self.done.append((at_end, self.coq.state))
                 if bad is None:
-                    self.skipped.append((end, stop))
-                    skipped_now += 1
+                    self.skipped.append((end, stop, known))
+                    if known:
+                        self.reused += 1
+                    else:
+                        skipped_now += 1
                     off = stop
                     continue
                 # the statement itself fails: report it like any error
                 while self.done[-1][0] > off:
                     self.done.pop()
-                out, err = bad, True
+                self.error, out, err = bad, bad[2], True
             else:
                 out, err = self.coq.send(new[off:end])
+                self.sent += 1
+                if err:
+                    self.error = (off, new[off:end], out)
+                elif opening is None:
+                    ext = proof_extent(new, blank, off, end)
+                    if ext:
+                        opening = (off, ext["stop"])
             if err:
                 at = self.line_of(off + len(new[off:end]) - len(new[off:end].lstrip()))
                 self.coq.back_to(self.done[-1][1])
@@ -972,18 +1674,58 @@ class Session:
                             % (self.name, at, out))
                 break
             self.done.append((end, self.coq.state))
+            if opening and end == opening[1]:
+                self.checked.add(opening)        # its Qed/Admitted went through
+                opening = None
             off = end
         self.note_loaded()
         stop = self.line_of(self.done[-1][0]) if self.done[-1][0] else 0
         msgs.append(self.goals())
         msgs.append("rocq-live: checked up to %s line %d (asked for line %s)"
                     % (self.name, stop, line or "EOF"))
-        n = len(self.skipped)
+        n = sum(1 for x in self.skipped if not x[2])
         if n:
             msgs.append("rocq-live: %d finished proof(s) before it taken as Admitted%s (statements "
                         "checked, tactics not; goto --full checks them)"
                         % (n, " (%d just now)" % skipped_now if skipped_now != n else ""))
+        if self.reused:
+            msgs.append("rocq-live: %d proof(s) checked before were not re-run (nothing they depend "
+                        "on changed; statements re-checked)" % self.reused)
         return "\n".join(msgs), failed
+
+    def carry_over(self, old, new, d, k):
+        """The file changed from `old` to `new` in [d, len - k). If only
+        comments or white space between sentences changed, move the
+        session's offsets to the new text and return True. Otherwise keep as
+        checked the proofs before the change, and those after it if the change
+        is one edit_effect understands: all of them after a change to the
+        tactics of a Qed proof, else those that cannot see the names it
+        changed (see edit_effect, affected_proofs)."""
+        delta = len(new) - len(old)
+        s0 = [e for e, _ in self.done if e <= d][-1]      # a sentence boundary before d
+        if not (any(e > d for e, _ in self.done) or any(b > d for _, b in self.checked)):
+            return False                                  # nothing after the change to keep
+        pairs = cosmetic_pairs(old, new, s0, len(old) - k, len(new) - k)
+        if pairs is not None:
+            def moved(x):
+                return x if x <= s0 else pairs.get(x, x + delta)
+            self.done = [(moved(e), st) for e, st in self.done]
+            self.skipped = [(moved(b), moved(e), kn) for b, e, kn in self.skipped]
+            self.checked = {(moved(a), moved(b)) for a, b in self.checked}
+            self.text = new
+            return True
+        edit = edit_effect(old, new, d, k, [e for e, _ in self.done if e <= d])
+        kept = {(a, b) for a, b in self.checked if b <= d}
+        if edit:
+            first, old_stop, new_stop, names, walk = edit
+            later = {(a + delta, b + delta) for a, b in self.checked if a >= old_stop}
+            if names:                 # names changed: keep what cannot see them
+                affected = affected_proofs(new, blank_comments(new), walk, names,
+                                           skip=(first, new_stop) if walk < first else None)
+                later = set() if affected is None else later - affected
+            kept |= later
+        self.checked = kept
+        return False
 
     def handle(self, cmd, arg):
         """One request: (output, error?). goto/run/back also save the
@@ -1003,9 +1745,11 @@ class Session:
             res = self.try_(arg["tactics"], arg["each_timeout"])
         elif cmd == "audit":
             res = self.audit(arg.get("names") or [], arg.get("allow") or self.proj.get("axioms") or [])
+        elif cmd == "check":
+            res = self.check(arg.get("name") or self.name)
         else:
             return "rocq-live: unknown command " + cmd, True
-        if cmd in ("goto", "run", "back", "audit"):
+        if cmd in ("goto", "run", "back", "audit", "check"):
             save_recipe(self.path, self.line, [t for _, t in self.runs])
         return res
 
@@ -1079,7 +1823,7 @@ class Session:
         declarations (or of `names`) against the allowed axioms. Checks the
         whole file first; afterwards the session is back where it was."""
         line, runs = self.line, [text for _, text in self.runs]
-        out, failed = self.goto(0, full=True)
+        out, failed = self.goto(0, strict=True)     # Print Assumptions needs real proofs
         if failed:
             return ("rocq-live audit %s: FAIL (the file does not check)\n%s" % (self.name, out)), True
         text = blank_comments(self.text)
@@ -1127,6 +1871,56 @@ class Session:
                 rep_.append("rocq-live: note: after the audit, this run no longer applies: %s" % t)
                 break
         return "\n".join(rep_), verdict == "FAIL"
+
+    def check(self, name):
+        """coqc's verdict on the whole file: every proof checked (nothing taken
+        as Admitted), the first error in coqc's format, and coqc's end-of-file
+        rules (no open proof, Section or Module). Only the text from the first
+        change since the last goto/check is re-run. The session stays at the
+        end of the file, or before the error, so the next check after a fix
+        starts there. Error code 1: the file does not check; 2: not checked."""
+        t0 = time.time()
+        out, failed = self.goto(0, full=True)
+        total = count_sentences(self.text)
+        if failed and self.error is None:
+            return out + "\nrocq-live: %s NOT CHECKED" % name, 2
+        if failed and "rocq-live: step interrupted" in self.error[2]:
+            return ("%s\nrocq-live: %s NOT CHECKED: the check was interrupted (see above)"
+                    % (self.error[2], name)), 2
+        diag = coqc_diag(self.text, self.error, name) if failed else self.eof_error(name)
+        stats = "[%s%s, %.1f s]" % ("all %d sentences run" % total if self.sent >= total else
+                                    "%d of %d sentences re-run" % (self.sent, total),
+                                    ", %d proof(s) checked before kept" % self.reused if self.reused else "",
+                                    time.time() - t0)
+        if diag:
+            return "%s\nrocq-live: %s FAILED %s" % (diag, name, stats), 1
+        return "rocq-live: %s OK %s" % (name, stats), False
+
+    def eof_error(self, name):
+        """coqc's error at the end of a file that leaves a proof, Section or
+        Module open (asked of Rocq itself), else ""."""
+        out, err = self.query("Show Conjectures.")
+        pending = out.split() if not err else []
+        if pending:
+            return "Error: There are pending proofs in file %s: %s." % (name, ", ".join(pending))
+        kinds, blocks, before = block_kinds(blank_comments(self.text)), [], self.coq.state
+        try:
+            for _ in range(1000):
+                # ending a block that does not exist names the innermost one
+                out, err = self.coq.send("End rocq_live_no_such_block.")
+                m = re.search(r"Last block to end has name (\S+?)\.?\s*$", out, re.M)
+                if not m:
+                    break
+                blocks.append("%s %s" % (kinds.get(m.group(1), "section"), m.group(1)))
+                out, err = self.coq.send("End %s." % m.group(1))
+                if err:
+                    break
+        finally:
+            self.coq.back_to(before)
+        if not blocks:
+            return ""
+        listed = blocks[0] if len(blocks) == 1 else ", ".join(blocks[:-1]) + " and " + blocks[-1]
+        return "Error: The %s %s to be closed." % (listed, "needs" if len(blocks) == 1 else "need")
 
 
 # ---------------------------------------------------------- daemon
@@ -1430,7 +2224,7 @@ def upgraded(sock):
 
 
 def request(sock, cmd, arg=None, proj=None):
-    default = TIMEOUT_GOTO if cmd == "goto" else TIMEOUT_STEP
+    default = TIMEOUT_GOTO if cmd in ("goto", "check") else TIMEOUT_STEP
     timeout = float(os.environ.get("ROCQ_LIVE_TIMEOUT", default))
     c = socket.socket(socket.AF_UNIX)
     c.connect(sock)
@@ -1457,11 +2251,13 @@ def daemon_enabled():
     return os.environ.get("ROCQ_LIVE_DAEMON", "1") != "0"
 
 
-def start(file, line=0, full=False):
+def start(file, line=0, full=False, proj=None, first=None):
+    """A fresh session for FILE; its first request is a goto to LINE, or
+    `first` = (cmd, arg)."""
     path = norm(file)
     if not daemon_enabled():
-        return local("goto", path, {"line": line, "full": full})
-    proj = resolve(path)
+        return local("goto", path, {"line": line, "full": full}, proj=proj)
+    proj = proj or resolve(path)
     sock = sock_path(path)
     kill_session(sock)
     os.makedirs(SESSION_DIR, exist_ok=True)
@@ -1479,19 +2275,68 @@ def start(file, line=0, full=False):
         time.sleep(0.05)
     else:
         return "rocq-live: session did not start; see %s.log" % sock, True
-    out, err = request(sock, "goto", {"line": line, "full": full})
+    out, err = request(sock, *(first or ("goto", {"line": line, "full": full})))
     return "\n".join(notes + [describe(path, proj), out]), err
 
 
 def goto(file, line=0, full=False):
     path = norm(file)
-    if not daemon_enabled():
-        return local("goto", path, {"line": line, "full": full})
-    sock = sock_path(path)
-    if not alive(sock) or upgraded(sock):
-        return start(file, line, full)
     proj = resolve(path)              # rebuild imports; maybe a new load path
-    return request(sock, "goto", {"line": line, "full": full}, proj)
+    note = stale_note(path, proj)
+    sock = sock_path(path)
+    if not daemon_enabled():
+        out, err = local("goto", path, {"line": line, "full": full}, proj=proj)
+    elif not alive(sock) or upgraded(sock):
+        out, err = start(file, line, full, proj)
+    else:
+        out, err = request(sock, "goto", {"line": line, "full": full}, proj)
+    return (note + "\n" + out if note else out), err
+
+
+def check(file, allow_stale=False, rebuild=False):
+    """coqc's verdict on FILE from its live session (see Session.check).
+    Error code 1: FILE does not check; 2: it was not checked (a dependency
+    is out of date or does not build, or no session)."""
+    path = norm(file)
+    name = coqc_name(file)
+    try:
+        proj = resolve(path)
+    except Fail as e:
+        return "%s\nrocq-live: %s NOT CHECKED" % (e, name), 2
+    notes = []
+    if rebuild:
+        out, err = build(path, proj, deps_only=True)
+        if err:
+            return "%s\nrocq-live: %s NOT CHECKED: a dependency does not compile" % (out, name), 2
+        if "compiled" in out:
+            notes.append(out)
+    stale = stale_deps(path, proj)
+    if stale and not allow_stale:
+        return ("rocq-live: %s NOT CHECKED: %d of its dependencies %s out of date (make would rebuild "
+                "%s):\n%s\nrocq-live: rebuild with `rocq-live compile %s --deps-only` (MCP: rocq_compile, "
+                "deps_only), or `check --rebuild`; or check against the old .vo with --allow-stale"
+                % (name, len(stale), "is" if len(stale) == 1 else "are",
+                   "it" if len(stale) == 1 else "them", stale_list(stale), file)), 2
+    if stale:
+        notes.append("rocq-live: warning: checking against out-of-date dependencies (--allow-stale):\n"
+                     + stale_list(stale))
+    arg = {"name": name}
+    if not daemon_enabled():
+        out, err = local("check", path, arg, proj=proj)
+    else:
+        sock = sock_path(path)
+        if not alive(sock) or upgraded(sock):
+            out, err = start(file, proj=proj, first=("check", arg))
+            if not alive(sock):
+                return "%s\nrocq-live: %s NOT CHECKED" % (out, name), 2
+        else:
+            out, err = request(sock, "check", arg, proj)
+    return "\n".join(notes + [out]), err
+
+
+def compile_(file, deps_only=False):
+    path = norm(file)
+    return build(path, resolve(path), deps_only)
 
 
 _notes = []          # notes for the next reply (a restored session)
@@ -1595,16 +2440,16 @@ def audit(file, names=None, allow=None):
     return request(sock, "audit", arg, resolve(path))
 
 
-def local(cmd, path, arg=None, line=None):
+def local(cmd, path, arg=None, line=None, proj=None):
     """No-daemon mode: a coqtop for this call only. The state comes from the
     recipe (the last goto line, fast replay, and the runs on top), or from
     LINE when given; goto/run/back save the recipe again."""
-    proj = resolve(path)
+    proj = proj or resolve(path)
     s = Session(path, proj)
     try:
-        default = TIMEOUT_GOTO if cmd in ("goto", "audit") else TIMEOUT_STEP
+        default = TIMEOUT_GOTO if cmd in ("goto", "audit", "check") else TIMEOUT_STEP
         timeout = float(os.environ.get("ROCQ_LIVE_TIMEOUT", default))
-        if cmd in ("goto", "audit"):
+        if cmd in ("goto", "audit", "check"):
             s.coq.timeout = timeout
             return s.handle(cmd, arg)
         rec = load_recipe(path) if line is None else None
@@ -1771,6 +2616,27 @@ TOOLS = [
       "names": ("array", "Only these declarations (qualified if inside a Module)."),
       "allow": ("array", "Allowed axiom names, overriding the project's `axioms`.")},
      ["file"]),
+    ("rocq_check", "Check the whole FILE as coqc would, much faster: the live session re-runs "
+     "only what changed since the last rocq_check/rocq_goto can affect (after an edit to a Qed "
+     "proof's tactics, just that proof; to a statement, definition or instance, the proofs that "
+     "can see it; comments "
+     "and white space, nothing), so the verdict after an edit usually takes a fraction of a "
+     "second instead of a full compile. Every proof is checked (nothing is taken "
+     "as Admitted) and a file that leaves a proof, Section or Module open fails, as with coqc. "
+     "Gives OK, or the first error in coqc's format (File \"...\", line N, characters A-B). "
+     "Refuses, without checking, when a dependency's .vo is out of date (its .v was edited "
+     "since): then rocq_compile with deps_only, or allow_stale. Writes no .vo (rocq_compile does).",
+     {"file": ("string", FILE_DOC),
+      "allow_stale": ("boolean", "Check against out-of-date dependencies anyway (their old .vo).")},
+     ["file"]),
+    ("rocq_compile", "Build .vo files with the project's own build step (coqc with the load "
+     "path, dune, or `compile` in .rocq-live): first FILE's out-of-date dependencies in "
+     "dependency order, then FILE itself unless deps_only. Use it when rocq_check refuses "
+     "because a dependency is out of date, or when other files need FILE's new .vo. Running "
+     "sessions that loaded a rebuilt .vo reload it by themselves.",
+     {"file": ("string", FILE_DOC),
+      "deps_only": ("boolean", "Only rebuild FILE's out-of-date dependencies, not FILE.")},
+     ["file"]),
     ("rocq_back", "Undo the last N rocq_run calls (default 1) and show the goals.",
      {"file": ("string", FILE_DOC), "n": ("integer", "How many runs to undo.")}, ["file"]),
     ("rocq_goals", "Show the current goals of FILE's session.",
@@ -1788,9 +2654,10 @@ def tool_list():
     out = []
     for name, desc, props, req in TOOLS:
         # hints for clients' approval rules: no tool edits source files (a
-        # goto may build the project's imports, as a build would)
+        # goto may build the project's imports, as a build would); only
+        # rocq_compile exists to write files (.vo)
         out.append({"name": name, "description": desc,
-                    "annotations": {"readOnlyHint": True, "destructiveHint": False,
+                    "annotations": {"readOnlyHint": name != "rocq_compile", "destructiveHint": False,
                                     "idempotentHint": name in ("rocq_goals", "rocq_sessions", "rocq_info", "rocq_try"),
                                     "openWorldHint": False},
                     "inputSchema": {
@@ -1815,6 +2682,10 @@ def call_tool(name, a):
         return safe(try_, f, [tacs] if isinstance(tacs, str) else tacs, at)
     if name == "rocq_audit":
         return safe(audit, f, a.get("names") or [], a.get("allow") or [])
+    if name == "rocq_check":
+        return safe(check, f, bool(a.get("allow_stale")))
+    if name == "rocq_compile":
+        return safe(compile_, f, bool(a.get("deps_only")))
     if name == "rocq_back":
         return safe(back, f, int(a.get("n") or 1))
     if name == "rocq_goals":
@@ -1850,7 +2721,9 @@ def mcp():
                       "instructions": "Live Rocq proof sessions. Use rocq_goto to see the "
                       "goal at a line (edit the file, then rocq_goto again: only the change "
                       "is re-checked), rocq_run/rocq_back to try tactics, rocq_query for "
-                      "Search/Check/Print."}
+                      "Search/Check/Print. To know whether a whole file compiles, use "
+                      "rocq_check (coqc's verdict, re-checking only what changed) instead of "
+                      "running coqc; rocq_compile writes the .vo when other files need it."}
         elif method == "tools/list":
             result = {"tools": tool_list()}
         elif method == "tools/call":
@@ -1941,6 +2814,17 @@ def main(argv):
             else:
                 names.append(rest[0]); rest = rest[1:]
         out, err = safe(audit, args[0], names, allow)
+    elif cmd == "check" and args:
+        opts = {"--allow-stale", "--rebuild"}
+        rest = [x for x in args if x not in opts]
+        if len(rest) != 1:
+            print(usage, file=sys.stderr); return 2
+        out, err = safe(check, rest[0], "--allow-stale" in args, "--rebuild" in args)
+    elif cmd == "compile" and args:
+        rest = [x for x in args if x != "--deps-only"]
+        if len(rest) != 1:
+            print(usage, file=sys.stderr); return 2
+        out, err = safe(compile_, rest[0], "--deps-only" in args)
     elif cmd in ("start", "goto") and args:
         full = "--full" in args
         f, line, rest = split_file_line([x for x in args if x != "--full"])
@@ -1959,7 +2843,7 @@ def main(argv):
     else:
         print(usage, file=sys.stderr); return 2
     print(out)
-    return 1 if err else 0
+    return int(err) if err else 0       # check: 2 = not checked
 
 
 def entry():

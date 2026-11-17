@@ -30,11 +30,14 @@ Qed.
 CMD = os.environ["ROCQ_LIVE_CMD"].split() if os.environ.get("ROCQ_LIVE_CMD") else [sys.executable, TOOL]
 
 
-def sh(*args, check=None, env=None):
+def sh(*args, check=None, env=None, cwd=None, code=None):
     e = dict(os.environ, **(env or {}))
-    r = subprocess.run(CMD + list(args), capture_output=True, text=True, env=e)
+    r = subprocess.run(CMD + list(args), capture_output=True, text=True, env=e, cwd=cwd)
     if check is not None:
         assert (r.returncode == 0) == check, "rocq-live %s -> %d\n%s%s" % (args, r.returncode, r.stdout, r.stderr)
+    if code is not None:
+        assert r.returncode == code, "rocq-live %s -> %d, not %d\n%s%s" % (
+            args, r.returncode, code, r.stdout, r.stderr)
     return r.stdout + r.stderr
 
 
@@ -56,16 +59,17 @@ class Project(unittest.TestCase):
             f.write(text)
 
     @classmethod
-    def compile_a(cls):
-        # compile with the same toolchain rocq-live uses: its coqtop's coqc
+    def coqc(cls):
+        """coqc of the toolchain rocq-live uses (its coqtop's switch)."""
         info = sh("info", os.path.join(cls.dir, "theories", "A.v"))
-        env = os.environ.copy()
         if "opam switch" in info:
             sw = info.split("opam switch ")[1].split(" ")[0]
-            cmd = ["opam", "exec", "--switch=" + sw, "--", "coqc"]
-        else:
-            cmd = ["coqc"]
-        subprocess.run(cmd + ["-Q", "theories", "My", "theories/A.v"], cwd=cls.dir, env=env, check=True)
+            return ["opam", "exec", "--switch=" + sw, "--", "coqc"]
+        return ["coqc"]
+
+    @classmethod
+    def compile_a(cls):
+        subprocess.run(cls.coqc() + ["-Q", "theories", "My", "theories/A.v"], cwd=cls.dir, check=True)
 
     @classmethod
     def tearDownClass(cls):
@@ -128,7 +132,10 @@ class Project(unittest.TestCase):
         p.wait(10)
         p.stdout.close()
         self.assertEqual(got[1]["result"]["serverInfo"]["name"], "rocq-live")
-        self.assertIn("rocq_goto", [t["name"] for t in got[2]["result"]["tools"]])
+        tools = {t["name"]: t for t in got[2]["result"]["tools"]}
+        self.assertIn("rocq_goto", tools)
+        self.assertTrue(tools["rocq_check"]["annotations"]["readOnlyHint"])
+        self.assertFalse(tools["rocq_compile"]["annotations"]["readOnlyHint"])   # writes .vo
         self.assertFalse(got[3]["result"]["isError"])
         self.assertIn("double n = 2 * n", got[3]["result"]["content"][0]["text"])
         self.assertIn("n + n = 2 * n", got[4]["result"]["content"][0]["text"])   # in order
@@ -212,7 +219,8 @@ class Project(unittest.TestCase):
         self.assertIn("error in the sentence at theories/F.v line 1", out)
         # an edited proof is checked even without --full
         sh("start", f + ":7", check=True)
-        self.write("F.v", open(f).read().replace("exact I.", "exact I. "))
+        with open(f) as fh:
+            self.write("F.v", fh.read().replace("exact I.", "exact (I)."))
         out = sh("goto", f + ":7", check=False)
         self.assertIn("error in the sentence at theories/F.v line 1", out)
         sh("stop", f)
@@ -243,8 +251,234 @@ class Project(unittest.TestCase):
         self.assertIn("n + n = 2 * n", sh("goals", self.b, check=True, env=env))    # from the recipe
         self.assertIn("double n = 2 * n", sh("back", self.b, check=True, env=env))
         self.assertIn("1 of 2 tactics work", sh("try", self.b, "lia", "unfold double; lia", check=True, env=env))
+        self.assertIn("./theories/B.v OK", sh("check", "theories/B.v", code=0, env=env, cwd=self.dir))
         self.assertIn("0 session(s)", sh("list", check=True))                         # nothing left running
         sh("stop", self.b, env=env)
+
+    def test_e_check_matches_coqc(self):
+        """check gives coqc's diagnostics (byte for byte) and exit code."""
+        cases = {
+            "CkOk.v": "From My Require Import A.\nLemma t : double 1 = 2.\nProof. reflexivity. Qed.\n",
+            "CkTerm.v": "(* \u00e9t\u00e9 *) Lemma c : 1 = 1.\nProof. (* \u00fc *) exact (eq_refl\n   2).\nQed.\n",
+            "CkSyntax.v": "Definition x := (1 + .\n",
+            "CkQed.v": "Lemma d : 1 = 1.\nProof.\nQed.\n",
+            "CkOpen.v": "Lemma a : 1 = 1.\nProof.\n",
+            "CkBlocks.v": "Module M.\nSection S.\nModule Type T.\nEnd T.\nDefinition y := 1.\n",
+            "CkNested.v": "Lemma a : 1 = 1.\nProof.\nLemma b : 2 = 2.\n",
+        }
+        coqc = self.coqc()
+        for name, text in cases.items():
+            self.write(name, text)
+            rel = "theories/" + name
+            r = subprocess.run(coqc + ["-Q", "theories", "My", rel], cwd=self.dir,
+                               capture_output=True, text=True)
+            want = [l for l in (r.stdout + r.stderr).splitlines() if l.strip()]
+            for attempt in ("cold", "warm"):
+                p = subprocess.run(CMD + ["check", rel], cwd=self.dir, capture_output=True, text=True)
+                got = [l for l in p.stdout.splitlines() if l.strip() and not l.startswith("rocq-live")]
+                self.assertEqual(got, want, "%s (%s)" % (name, attempt))
+                self.assertEqual(p.returncode, r.returncode, "%s (%s)\n%s" % (name, attempt, p.stdout))
+            sh("stop", os.path.join(self.dir, rel))
+
+    def test_f_check_rechecks_only_the_change(self):
+        f = os.path.join(self.dir, "theories", "Inc.v")
+        lemmas = ["Lemma l%d : %d = %d.\nProof.\n  reflexivity.\nQed.\n" % (i, i, i) for i in range(30)]
+        self.write("Inc.v", "".join(lemmas))
+        self.assertIn("OK [all 120 sentences run", sh("check", f, code=0))
+        self.write("Inc.v", "".join(lemmas[:-1]) + lemmas[-1].replace("reflexivity", "exact (eq_refl 3)"))
+        out = sh("check", f, code=1)
+        self.assertIn("line 119, characters 9-18", out)
+        self.assertIn("FAILED [1 of 120 sentences re-run", out)       # only the edited proof
+        self.write("Inc.v", "".join(lemmas))
+        self.assertIn("OK [2 of 120 sentences re-run", sh("check", f, code=0))
+        # proofs a goto took as Admitted are checked by check
+        self.write("Inc.v", lemmas[0].replace("reflexivity", "exact I") + "".join(lemmas[1:]))
+        sh("start", f + ":119", check=True)                 # l0 is taken as Admitted here
+        out = sh("check", f, code=1)
+        self.assertIn("line 3, characters 8-9", out)
+        sh("stop", f)
+
+    def test_g_out_of_date_dependencies_and_compile(self):
+        d = os.path.join(self.dir, "theories")
+        self.write("G1.v", "Definition g := 1.\n")
+        self.write("G2.v", "From My Require Import G1.\nDefinition h := g.\n")
+        self.write("G3.v", "From My Require Import G2.\nLemma k : h = 1.\nProof. reflexivity. Qed.\n")
+        g3 = os.path.join(d, "G3.v")
+        out = sh("check", g3, code=2)                                 # nothing built yet
+        self.assertIn("theories/G1.v has no .vo", out)
+        self.assertIn("theories/G2.v has no .vo", out)
+        out = sh("compile", g3, "--deps-only", code=0)
+        self.assertIn("compiled theories/G1.v, theories/G2.v", out)  # dependencies first
+        self.assertFalse(os.path.exists(os.path.join(d, "G3.vo")))
+        self.assertIn("OK", sh("check", g3, code=0))
+        # edit G1 (its .v now newer than its .vo): G2 is out of date through it
+        self.write("G1.v", "Definition g := 2.\n")
+        earlier = os.path.getmtime(os.path.join(d, "G1.v")) - 5
+        os.utime(os.path.join(d, "G1.vo"), (earlier, earlier))
+        out = sh("check", g3, code=2)
+        self.assertIn("theories/G1.v is newer than its .vo", out)
+        self.assertIn("theories/G2.v requires theories/G1.v, which is out of date", out)
+        self.assertIn("warning: 2 of this file's dependencies are out of date", sh("goto", g3, check=True))
+        out = sh("check", g3, "--allow-stale", code=0)               # the old G1.vo: g = 1
+        self.assertIn("checking against out-of-date dependencies", out)
+        out = sh("check", g3, "--rebuild", code=1)                   # the new G1: g = 2
+        self.assertIn("compiled theories/G1.v, theories/G2.v", out)
+        self.assertIn("line 3, characters", out)
+        self.write("G3.v", "From My Require Import G2.\nLemma k : h = 2.\nProof. reflexivity. Qed.\n")
+        self.assertIn("OK", sh("check", g3, code=0))
+        self.assertIn("compiled theories/G3.v", sh("compile", g3, code=0))
+        self.assertTrue(os.path.exists(os.path.join(d, "G3.vo")))
+        self.write("G3.v", "Lemma bad : 1 = 2.\nProof. reflexivity. Qed.\n")
+        self.assertIn("compiling theories/G3.v failed", sh("compile", g3, code=1))
+        sh("stop", g3)
+
+    def test_h_check_agrees_with_coqc_over_edits(self):
+        """Random edits, each followed by check and coqc: same verdict and
+        diagnostics every time, including edits whose effects reach later
+        proofs (a Section proof's variables, a Set inside a proof, a
+        statement, a Defined body), which must not be answered from earlier
+        checks."""
+        import random
+        toggles = [   # (text in the base file, the alternative)
+            ("Lemma l1 : 1 = 1.\nProof.\n  reflexivity.", "Lemma l1 : 1 = 1.\nProof.\n  simpl. reflexivity."),
+            ("Lemma l2 : 2 = 2.", "Lemma l2 : 3 = 3."),                    # l4 uses l2
+            ("Lemma l3 : 3 = 3.\nProof.\n  reflexivity.", "Lemma l3 : 3 = 3.\nProof.\n  exact I."),
+            ("(* top *)", "(* top, longer comment *)\n"),
+            ("Lemma s1 : True.\nProof.\n  exact I.", "Lemma s1 : True.\nProof.\n  pose proof n as m. exact I."),
+            ("Lemma ab : True.\nProof.\n  Set Implicit Arguments.", "Lemma ab : True.\nProof.\n  idtac."),
+            ("Definition dd : nat.\nProof.\n  exact 1.", "Definition dd : nat.\nProof.\n  exact 2."),
+            ("Lemma l5 : 5 = 5.\nProof.\n  reflexivity.", "Lemma l5 : 5 = 5.\nProof.\n    reflexivity."),
+            ("Lemma l6 : 6 = 6.\nProof.\n  reflexivity.", "Lemma l6 : 6 = 6.\nProof.\n  idtac.\n  reflexivity."),
+            ("Lemma l7 : 7 = 7.", "Lemma l7 : 8 = 8."),                    # u7 sees it through a hint
+            ("Lemma l8 : 8 = 8.", "Lemma l8 : 9 = 9."),                    # u8 through an Ltac
+            ("Lemma l9 : 9 = 9.", "Lemma l9 : 10 = 10."),                  # u9 through a Definition
+            ("Lemma l10 : 10 = 10.", "Lemma l10 : 10 + 0 = 10."),          # nothing uses it
+            ("Lemma l11 : 11 = 11.", "Lemma l11b : 11 = 11."),             # renamed: u11 loses it
+            ("Lemma l13 : 13 = 13.", "Lemma l13 : 14 = 14."),              # w13 sees it through v13's type
+            ("Definition dv := 5.", "Definition dv := 6."),                # udv computes with it
+            ("Definition unused := 1.", "Definition unused := 2."),        # nothing uses it
+            ("Ltac use8 := exact l8.", "Ltac use8 := exact I."),           # u8 runs it
+            ("(* slot *)", "Definition double (n : nat) := n."),          # shadows My.A.double for ud
+            ("Instance op_nat : Op nat := Nat.add.", "Instance op_nat : Op nat := Nat.mul."),
+                                                     # ut reaches it by typeclass search, through twice
+        ]
+        base = "\n".join([
+            "(* top *)",
+            "From My Require Import A.",
+            "Class Op (A : Type) := op : A -> A -> A.",
+            "Definition twice {A} `{Op A} (x : A) := op x x.",     # generic, before the instance
+            "Definition dv := 5.",
+            "Definition unused := 1.",
+            "(* slot *)",
+            "Lemma l1 : 1 = 1.\nProof.\n  reflexivity.\nQed.",
+            "Lemma l2 : 2 = 2.\nProof.\n  reflexivity.\nQed.",
+            "Lemma l3 : 3 = 3.\nProof.\n  reflexivity.\nQed.",
+            "Section S.\nVariable n : nat.",
+            "Lemma s1 : True.\nProof.\n  exact I.\nQed.",
+            "Lemma s2 : True.\nProof.\n  exact s1.\nQed.",               # takes n when s1 does
+            "End S.",
+            "Lemma use_s2 : True.\nProof.\n  exact s2.\nQed.",
+            "Lemma use_s1 : True.\nProof.\n  exact s1.\nQed.",          # fails once s1 takes n
+            "Lemma ab : True.\nProof.\n  Set Implicit Arguments.\n  exact I.\nQed.",   # outlives the Qed
+            "Definition idf (A : Type) (x : A) := x.",
+            "Lemma uses_ab : True.\nProof.\n  pose proof (idf 1) as h. exact I.\nQed.",   # needs A implicit
+            "Definition dd : nat.\nProof.\n  exact 1.\nDefined.",
+            "Lemma ddv : dd = 1.\nProof.\n  reflexivity.\nQed.",       # needs dd's body
+            "Lemma l4 : 2 = 2.\nProof.\n  exact l2.\nQed.",            # needs l2's statement
+            "Lemma l5 : 5 = 5.\nProof.\n  reflexivity.\nQed.",
+            "Lemma l6 : 6 = 6.\nProof.\n  reflexivity.\nQed.",
+            "Lemma l7 : 7 = 7.\nProof.\n  reflexivity.\nQed.",
+            "Create HintDb db7.\n#[export] Hint Resolve l7 : db7.",
+            "Lemma l8 : 8 = 8.\nProof.\n  reflexivity.\nQed.",
+            "Ltac use8 := exact l8.",
+            "Lemma l9 : 9 = 9.\nProof.\n  reflexivity.\nQed.",
+            "Definition d9 := l9.",
+            "Lemma l10 : 10 = 10.\nProof.\n  reflexivity.\nQed.",
+            "Lemma l11 : 11 = 11.\nProof.\n  reflexivity.\nQed.",
+            "Lemma u7 : 7 = 7.\nProof.\n  solve [eauto with nocore db7].\nQed.",
+            "Lemma u8 : 8 = 8.\nProof.\n  use8.\nQed.",
+            "Lemma u9 : 9 = 9.\nProof.\n  exact d9.\nQed.",
+            "Lemma u11 : 11 = 11.\nProof.\n  exact l11.\nQed.",
+            "Lemma u12 : 12 = 12.\nProof.\n  reflexivity.\nQed.",
+            "Lemma l13 : 13 = 13.\nProof.\n  reflexivity.\nQed.",
+            "Lemma v13 : l13 = l13.\nProof.\n  reflexivity.\nQed.",
+            "Lemma w13 : True.\nProof.\n  match type of v13 with @eq (13 = 13) _ _ => exact I end.\nQed.",
+            "#[export] Instance op_nat : Op nat := Nat.add.",
+            "Lemma udv : dv = 5.\nProof.\n  reflexivity.\nQed.",
+            "Lemma ud : double 2 = 4.\nProof.\n  reflexivity.\nQed.",
+            "Lemma ut : twice 3 = 6.\nProof.\n  reflexivity.\nQed.",
+            "Lemma u14 : 14 = 14.\nProof.\n  reflexivity.\nQed.", ""])
+        rel = "theories/Rand.v"
+        f = os.path.join(self.dir, rel)
+        coqc = self.coqc()
+        rng = random.Random(7)
+        state = [False] * len(toggles)
+        # each edit on and off again (from the base file, every proof
+        # checked), then random sequences of them
+        order = [i for i in range(len(toggles)) for _ in (0, 1)]
+        order += [rng.randrange(len(toggles)) for _ in range(40)]
+        for step, i in enumerate([None] + order):
+            if i is not None:
+                state[i] = not state[i]
+            text = base
+            for (a, b), on in zip(toggles, state):
+                if on:
+                    self.assertIn(a, text)
+                    text = text.replace(a, b, 1)
+            self.write("Rand.v", text)
+            if rng.random() < 0.3:                   # sometimes a goto in between (fast replay)
+                sh("goto", "%s:%d" % (f, rng.randint(1, text.count("\n"))))
+            r = subprocess.run(coqc + ["-Q", "theories", "My", rel], cwd=self.dir,
+                               capture_output=True, text=True)
+            want = [l for l in (r.stdout + r.stderr).splitlines() if l.strip()]
+            p = subprocess.run(CMD + ["check", rel], cwd=self.dir, capture_output=True, text=True)
+            got = [l for l in p.stdout.splitlines() if l.strip() and not l.startswith("rocq-live")]
+            ctx = "step %d, toggles %s\n%s" % (step, [k for k, on in enumerate(state) if on], p.stdout)
+            self.assertEqual(got, want, ctx)
+            self.assertEqual(p.returncode, r.returncode, ctx)
+        sh("stop", f)
+
+    def test_i_tactic_edit_keeps_later_proofs(self):
+        f = os.path.join(self.dir, "theories", "Keep.v")
+        lemmas = ["Lemma k%d : %d = %d.\nProof.\n  reflexivity.\nQed.\n" % (i, i, i) for i in range(10)]
+        self.write("Keep.v", "".join(lemmas))
+        sh("check", f, code=0)
+        self.write("Keep.v", "".join(lemmas).replace("k3 : 3 = 3.\nProof.\n  reflexivity.",
+                                                     "k3 : 3 = 3.\nProof.\n  idtac.\n  reflexivity."))
+        out = sh("check", f, code=0)
+        self.assertIn("6 proof(s) checked before kept", out)            # k4..k9
+        with open(f) as fh:
+            self.write("Keep.v", "(* a comment *)\n" + fh.read())
+        self.assertIn("OK [0 of", sh("check", f, code=0))               # comments: nothing re-run
+        out = sh("audit", f, check=True)                                # audit runs every proof
+        self.assertIn("PASS", out)
+        self.assertIn("10 declaration(s) checked with Print Assumptions, 10 closed", out)
+        sh("stop", f)
+
+    def test_j_statement_edit_keeps_proofs_that_cannot_see_it(self):
+        f = os.path.join(self.dir, "theories", "Stm.v")
+        text = ("Lemma a : 1 = 1.\nProof.\n  reflexivity.\nQed.\n"
+                + "".join("Lemma b%d : %d = %d.\nProof.\n  reflexivity.\nQed.\n" % (i, i, i) for i in range(8))
+                + "Lemma c : 1 = 1.\nProof.\n  exact a.\nQed.\n")
+        self.write("Stm.v", text)
+        sh("check", f, code=0)
+        self.write("Stm.v", text.replace("Lemma a : 1 = 1.", "Lemma a : 2 = 2."))
+        out = sh("check", f, code=1)                       # c uses a: re-run, and fails
+        self.assertIn("8 proof(s) checked before kept", out)   # b0..b7 cannot see a
+        self.assertIn('line 39, characters 8-9:', out)
+        sh("stop", f)
+
+    def test_k_definition_edit_keeps_proofs_that_cannot_see_it(self):
+        f = os.path.join(self.dir, "theories", "Def.v")
+        text = ("Definition k := 1.\n"
+                + "".join("Lemma b%d : %d = %d.\nProof.\n  reflexivity.\nQed.\n" % (i, i, i) for i in range(6))
+                + "Lemma c : k = 1.\nProof.\n  reflexivity.\nQed.\n")
+        self.write("Def.v", text)
+        sh("check", f, code=0)
+        self.write("Def.v", text.replace("Definition k := 1.", "Definition k := 2."))
+        out = sh("check", f, code=1)                       # c computes with k: re-run, fails
+        self.assertIn("6 proof(s) checked before kept", out)
+        sh("stop", f)
 
     def test_5_stop_and_list(self):
         sh("goto", self.b, check=True)

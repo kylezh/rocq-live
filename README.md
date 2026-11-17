@@ -22,6 +22,16 @@ No more goals.
 Edit the file and call `goto` again: only the text from the first changed
 character onwards is re-checked.
 
+The same session also stands in for `coqc` while you edit. `rocq-live check
+FILE` gives `coqc`'s verdict, with the same diagnostics and exit code, but it
+re-runs only what an edit can affect. After an edit inside a proof, that is
+just the proof:
+
+```
+$ rocq-live check theories/Big.v          # coqc takes 11 s on this file
+rocq-live: ./theories/Big.v OK [41 of 163 sentences re-run, 19 proof(s) checked before kept, 0.3 s]
+```
+
 It is one Python file with no dependencies. It works as a **CLI** (for any
 agent with a shell) and as an **MCP server** (Claude Code, Codex, Cursor,
 Gemini CLI, …).
@@ -73,10 +83,14 @@ tool_timeout_sec = 600     # the first goto may build the file's imports
 To see a proof state, use `rocq-live goto FILE:LINE` (state before LINE);
 try tactics with `rocq-live run FILE 'tac.'`, undo with `rocq-live back FILE`,
 query with `rocq-live query FILE 'Search ...'`. After editing FILE, goto again.
+To know whether FILE compiles, run `rocq-live check FILE` instead of coqc
+(same verdict, re-checks only what changed); `rocq-live compile FILE` writes
+the .vo when other files need it.
 ```
 
-All tools are marked read-only (`readOnlyHint`): they never edit files. A
-`goto` may build the file's imports, as a build would.
+All tools except `rocq_compile` are marked read-only (`readOnlyHint`): they
+never write files, though a `goto` may build the file's imports, as a build
+would. `rocq_compile` exists to write `.vo` files.
 
 ## Commands
 
@@ -86,6 +100,8 @@ All tools are marked read-only (`readOnlyHint`): they never edit files. A
 | `run FILE[:LINE] 'tac1. tac2.'`  | `rocq_run`      | run on the current state (or on the state before LINE); an error changes nothing |
 | `query FILE 'Search …'`          | `rocq_query`    | run, print, undo (Search, Check, Print, About, …)       |
 | `try FILE 'lia' 'auto' …`        | `rocq_try`      | each tactic alone on the current state: which work, goals left (best first); state unchanged |
+| `check FILE [--allow-stale] [--rebuild]` | `rocq_check` | `coqc`'s verdict on the whole file, re-checking only what changed (see below) |
+| `compile FILE [--deps-only]`     | `rocq_compile`  | write `.vo` files: FILE's out-of-date dependencies in order, then FILE |
 | `audit FILE [NAME…] [--allow AX,…]` | `rocq_audit` | `Admitted`/`admit`/axioms, and `Print Assumptions` of each declaration against the allowed axioms: PASS/FAIL |
 | `back FILE [N]`                  | `rocq_back`     | undo the last N runs                                    |
 | `goals FILE`                     | `rocq_goals`    | current goals                                           |
@@ -96,6 +112,8 @@ All tools are marked read-only (`readOnlyHint`): they never edit files. A
 | `info FILE`                      | `rocq_info`     | detected root, toolchain and load path                  |
 
 Exit status: 0 on success, 1 on an error (Rocq or setup), 2 on bad usage.
+`check` uses `coqc`'s codes: 0 when the file checks, 1 when it does not, and 2
+when it was not checked (an out-of-date dependency, or no toolchain).
 
 **`try`** is for the moment an agent would otherwise guess one tactic per turn:
 
@@ -136,6 +154,116 @@ lemma being worked on (Rocq 9.0, M-series Mac):
 | restoring a stopped session from its recipe | 0.33 s |
 | one call in no-daemon mode | 0.19 s |
 
+**`check`** answers the question "does this file compile?" the way `coqc`
+does, but from the file's live session:
+- every proof is checked: nothing is taken as Admitted, and proofs that an
+  earlier `goto` skipped are checked now;
+- a file that leaves a proof, `Section` or `Module` open fails with `coqc`'s
+  message;
+- the first error is printed exactly as `coqc` prints it (`File "…", line N,
+  characters A-B:` and the message), so whatever parses `coqc` output still
+  works;
+- only what the last edit can affect is re-run (see below). After a failure
+  the session waits just before the error, so the check after the fix starts
+  there.
+
+It writes no `.vo`. A check that compiles is not a build, and your build
+stays in charge of `.vo` files.
+
+**What an edit re-runs.** Rocq checks a file top to bottom, so in general
+everything after an edit is re-checked. rocq-live re-runs less, by keeping
+track of which proofs have already been checked and what each edit can reach:
+- **An edit to a `Qed` proof's tactics.** What follows a `Qed` sees only the
+  lemma's statement, never its tactics. So only the edited proof is re-run.
+- **An edit to a lemma's statement, a definition (`Definition`, `Fixpoint`,
+  `Let`, `Example`), a `Defined` proof or an `Ltac`**, including adding or
+  deleting one. Only later proofs that can see it are re-run. Seeing it
+  means mentioning its name, or the name of a definition, proof statement or
+  `Ltac` that mentions it, and so on along the chain; computing with a
+  definition requires reaching it this way too.
+- **An edit to an `Instance`** of a class declared in the same file. Typeclass
+  search can use an instance without naming it, so the class and its methods
+  count as changed, followed from the class declaration on. That includes
+  generic code written before the instance, such as a function that calls a
+  method.
+- **Comments and white space** between sentences re-run nothing.
+
+If a changed name reaches something that later proofs can use *without*
+naming it, such as a `Hint`, an instance of another class, a `Notation`,
+`Arguments` or a coercion, everything after the edit is re-run instead. The
+same goes for edits to an `Inductive`, a `Record`, a `Notation`, a `Hint`, a
+`Section` or `Module` command, a `Program` definition, and an instance of a
+class from a library.
+
+A proof that is kept is replayed as `Admitted`: its statement is checked
+again, its tactics are not. Definitions and other commands after the edit
+always run again. A proof whose tactics include a command whose effect
+outlives its `Qed` (`Set Implicit Arguments`, `Hint`, `Ltac`, any capitalized
+command other than queries such as `Check` or `Search`) counts as changed
+as a whole. So does a proof in a `Section` without `Proof using`, since its
+tactics decide which section variables it takes.
+
+**Limits of this reuse.**
+- Tactics that search the whole environment for lemmas can use one without
+  naming it. CoqHammer's `hammer` and Tactician's `synth` are recognized, and
+  proofs using them are always re-run; set `ROCQ_LIVE_REUSE=0` if you use
+  another tactic like them.
+- The same gap as `coqc -vos`: tactics that add a universe constraint could
+  make a later proof fail with a universe inconsistency, and `check` would not
+  notice until that proof is re-run.
+
+`audit` always runs every proof, and `ROCQ_LIVE_REUSE=0` turns this reuse
+off.
+
+Measured on a file of 40 proofs that `coqc` checks in 11 s (Rocq 9.0,
+M-series Mac):
+
+| after                              | `check` |
+|------------------------------------|---------|
+| nothing changed                    | 0.19 s  |
+| a tactic edit near the end         | 0.40 s  |
+| a tactic edit in the middle        | 0.44 s  |
+| a tactic edit near the start       | 0.40 s  |
+| breaking a proof (first error)     | 0.15 s  |
+| fixing it                          | 0.40 s  |
+| a comment added near the top       | 0.15 s  |
+| a statement edit in the middle     | 0.44 s  |
+
+The first check of a file costs what `coqc` costs (11 s here). In this file
+no proof uses another; when one does, a statement edit also re-runs the
+proofs that use the lemma. Every result matched `coqc`. The tests check this
+over sequences of edits, including edits that reach later proofs through a
+hint, an `Ltac`, a definition, another proof's statement, a rename, a
+`Section`, a `Defined` body, a definition that shadows an imported one, and
+typeclass search through a generic function.
+
+**Out-of-date dependencies.** A session loads the `.vo` of each library the
+file requires, so a library edited but not rebuilt would be checked against
+its old version. That can make a correct proof fail, or a wrong one pass.
+`check` therefore refuses, with exit code 2, when a library the file requires
+(directly or not) is out of date by `make`'s rule: no `.vo`, a `.vo` older
+than its `.v`, or a `.vo` older than one it requires. It lists them:
+
+```
+$ rocq-live check theories/G3.v
+rocq-live: ./theories/G3.v NOT CHECKED: 2 of its dependencies are out of date (make would rebuild them):
+  theories/G1.v is newer than its .vo
+  theories/G2.v requires theories/G1.v, which is out of date
+```
+
+Then either rebuild them (`check --rebuild`, or `compile FILE --deps-only`),
+or check against the old `.vo` files anyway with `--allow-stale`. `goto`
+prints the same list as a warning but goes on. The dependencies come from
+`coqdep`; its results are cached and refreshed only for files whose `Require`
+lines changed. dune projects don't need this check, since `dune rocq top`
+rebuilds the imports before each `goto` or `check`.
+
+**`compile`** builds `.vo` files the way the project does: `coqc` with the
+load path (`_CoqProject`, `flags`), `dune build` in dune projects, or the
+`compile` command in `.rocq-live`. It builds FILE's out-of-date dependencies in
+dependency order, then FILE (unless `--deps-only`). Sessions that loaded a
+rebuilt `.vo` reload it by themselves.
+
 **`audit`** fails on any `Admitted`, `admit` or `give_up`, on an `Axiom` or
 `Parameter` that is not allowed, and on any declaration whose `Print
 Assumptions` lists an axiom that is not allowed. Admitted lemmas count, since
@@ -171,12 +299,16 @@ switch   rocq-9.0                      # opam switch to use (`path`: coqtop on P
 flags    -Q theories MyLib             # load path, verbatim
 loadpath scripts/loadpath.sh {file}    # or: a command that prints the flags
 build    make -j8                      # command run before each start/goto
+compile  make {vo}                     # how `compile` builds one file ({vo}, {file})
 axioms   classic functional_extensionality_dep   # axioms `audit` accepts
 ```
 
 Use `flags` for projects built by a plain `coqc` script, `loadpath` for custom
 build trees (for example one built with `coqc -vos` for speed), and `build`
-when `_CoqProject` `.vo`s should be rebuilt automatically.
+when `_CoqProject` `.vo`s should be rebuilt automatically. `compile` is how
+`rocq-live compile` builds one file; `{vo}` is the `.vo` path relative to the
+root and `{file}` the `.v`. A project using `loadpath` needs it, since
+rocq-live cannot know where its `.vo` files go.
 
 ### Environment
 
@@ -187,6 +319,7 @@ when `_CoqProject` `.vo`s should be rebuilt automatically.
 | `ROCQ_LIVE_TIMEOUT` | seconds per step (default 600 for goto, 120 otherwise)    |
 | `ROCQ_LIVE_TRY_TIMEOUT` | seconds per tactic in `try` (default 30)             |
 | `ROCQ_LIVE_FAST`    | `0`: `goto` checks every proof (as `--full`)              |
+| `ROCQ_LIVE_REUSE`   | `0`: after an edit inside a proof, re-run every proof after it    |
 | `ROCQ_LIVE_DAEMON`  | `0`: no background process (see [Recipes](https://github.com/kylezh/rocq-live#recipes-and-the-no-daemon-mode)) |
 
 The session limits below can also be set in the environment.
@@ -277,7 +410,10 @@ allowed (some CI runners and sandboxes).
 
 - **Proof state.** The checked prefix of each file stays in its session. When
   `goto` moves backward it jumps to a saved state (`BackTo`), which is instant.
-  When it moves forward or after an edit, it checks only the new text.
+  When it moves forward or after an edit, it checks only the new text, and
+  keeps the proofs that edit cannot affect (see `check`). Which proofs have
+  been checked is also kept when `coqtop` restarts (for example after hitting
+  a memory limit), so the replay after a restart is fast too.
 - **Sessions are shared.** A session is a background daemon keyed by the file's
   path, not owned by the agent. The CLI, the MCP server, several agents, and an
   MCP server restarted by its client all use the same warm session.
@@ -356,6 +492,11 @@ outline, notation lookup, and several errors per compile. rocq-live aims for no
 dependencies beyond `coqtop`, a CLI as well as MCP, sessions shared per file
 across agents, re-checking only what an edit changed, and machine-wide memory
 limits.
+
+[rocq-warm](https://github.com/zeldovich/rocq-warm) keeps a warm `rocq repl`
+per file to give `coqc`'s verdict after an edit, and refuses to check against
+stale libraries. rocq-live's `check` answers the same question from the same
+session that serves goals, tactics and queries.
 
 ## License
 
