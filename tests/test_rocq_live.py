@@ -25,6 +25,10 @@ Qed.
 """
 
 
+# the tests keep their own stats log (sessions they start inherit this)
+STATS = os.path.join(tempfile.mkdtemp(prefix="rocq-live-stats-"), "stats.jsonl")
+os.environ["ROCQ_LIVE_STATS_FILE"] = STATS
+
 # ROCQ_LIVE_CMD: test an installed command (e.g. a wheel's `rocq-live`)
 # instead of the script in this repository
 CMD = os.environ["ROCQ_LIVE_CMD"].split() if os.environ.get("ROCQ_LIVE_CMD") else [sys.executable, TOOL]
@@ -137,6 +141,7 @@ class Project(unittest.TestCase):
         self.assertTrue(tools["rocq_check"]["annotations"]["readOnlyHint"])
         self.assertFalse(tools["rocq_compile"]["annotations"]["readOnlyHint"])   # writes .vo
         self.assertFalse(tools["rocq_impact"]["annotations"]["readOnlyHint"])
+        self.assertTrue(tools["rocq_stats"]["annotations"]["readOnlyHint"])
         self.assertFalse(got[3]["result"]["isError"])
         self.assertIn("double n = 2 * n", got[3]["result"]["content"][0]["text"])
         self.assertIn("n + n = 2 * n", got[4]["result"]["content"][0]["text"])   # in order
@@ -557,6 +562,41 @@ class Project(unittest.TestCase):
         self.assertIn("  my_special_lemma : forall n : nat, n + 0 = n", out)
         out = sh("run", f, "rewrite lemma_special_my.", check=False)  # parts in another order
         self.assertIn("  my_special_lemma :", out)
+        # in a library that is not loaded: which one, and the Require line
+        out = sh("run", f, "rewrite Nat.add_comm.", check=False)
+        self.assertIn("rocq-live hint: Nat.add_comm is in Stdlib.Arith.PeanoNat, which is not loaded; "
+                      "add `From Stdlib Require Import PeanoNat.`", out)
+        self.assertIn("Nat.add_comm : forall n m : nat, n + m = m + n", out)
+        out = sh("run", f, "rewrite Nat.add_com.", check=False)     # and a typo
+        self.assertIn("Nat.add_com does not exist here; Nat.add_comm is in Stdlib.Arith.PeanoNat", out)
+        out = sh("run", f, "rewrite no_such_name_at_all.", check=False)
+        self.assertIn("no name like no_such_name_at_all is loaded", out)
+        self.assertNotIn("similar names", out)
+        self.assertIn("H2 : b = c", sh("goals", f, check=True))     # the lookups left no trace
+        sh("stop", f)
+
+    def test_o_stats(self):
+        f = os.path.join(self.dir, "theories", "Stats.v")
+        lemmas = ["Lemma s%d : %d = %d.\nProof.\n  reflexivity.\nQed.\n" % (i, i, i) for i in range(8)]
+        self.write("Stats.v", "".join(lemmas))
+        sh("stop", f)
+        sh("check", f, code=0)                                          # a full run: the baseline
+        self.write("Stats.v", "".join(lemmas).replace("s3 : 3 = 3.\nProof.\n  reflexivity.",
+                                                      "s3 : 3 = 3.\nProof.\n  idtac. reflexivity."))
+        sh("check", f, code=0)                                          # keeps s4..s7
+        self.write("Stats.v", "".join(lemmas).replace("reflexivity", "exact I"))
+        sh("check", f, "--all-errors", code=1)                          # 8 errors in one call
+        out = sh("stats", f, check=True)
+        self.assertIn("rocq-live stats: 3 request(s) on 1 file(s)", out)
+        self.assertIn("2 whole-file check(s) took", out)
+        self.assertIn("4 checked proof(s) kept instead of re-run", out)
+        self.assertIn("check --all-errors: 1 call(s) found 8 error(s), 7 more than one per call", out)
+        self.assertIn("calls   check 3", out)
+        self.assertIn("via cli 3", out)
+        n = len(open(STATS).readlines())
+        sh("check", f, code=1, env={"ROCQ_LIVE_STATS": "0"})              # recording off: no line
+        self.assertEqual(len(open(STATS).readlines()), n)
+        self.assertIn("nothing recorded", sh("stats", f, "--since", "1m", env={"ROCQ_LIVE_STATS_FILE": STATS + ".none"}))
         sh("stop", f)
 
     def test_5_stop_and_list(self):

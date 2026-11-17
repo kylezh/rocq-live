@@ -111,6 +111,7 @@ file's imports, as a build would. Those two exist to write `.vo` files.
 | `stop FILE` / `stop --all`       | `rocq_stop`     | kill the session(s)                                     |
 | `list`                           | `rocq_sessions` | running sessions: memory, idle time, limits             |
 | `gc`                             | —               | apply the limits now (this also happens automatically) |
+| `stats [FILE] [--since 7d]`      | `rocq_stats`    | what rocq-live did and saved, from its local log (see below) |
 | `info FILE`                      | `rocq_info`     | detected root, toolchain and load path                  |
 
 Exit status: 0 on success, 1 on an error (Rocq or setup), 2 on bad usage.
@@ -346,10 +347,53 @@ rocq-live hint: app_lenght does not exist here; similar names:
   ...
 ```
 
+`Search` only sees loaded libraries. When no loaded name is close, rocq-live
+looks for the name, or one containing it, in the `.glob` files of the
+installed libraries and the project. It then confirms the find by requiring
+that library and checking the name, in a step that is undone right after:
+
+```
+$ rocq-live run Foo.v 'rewrite Nat.add_com.'
+...
+rocq-live hint: Nat.add_com does not exist here; Nat.add_comm is in Stdlib.Arith.PeanoNat, which is not loaded; add `From Stdlib Require Import PeanoNat.`
+  Nat.add_comm : forall n m : nat, n + m = m + n
+```
+
+If nothing similar exists anywhere, the hint says so instead of listing
+unrelated names.
+
 **Hints.** For an error whose fix isn't in the message, a `rocq-live hint:`
 line follows it. This covers a missing load-path binding, a library that is
 not built, a `.vo` from another Rocq version, a stale `.vo`, a step stopped for
 time or memory, and a proof command given outside a proof.
+
+**`stats`** shows what rocq-live has done and what it saved, from a log it
+keeps on your machine (`~/.cache/rocq-live/stats.jsonl`). The log records one
+line per request: the command, the file, how long it took, and what it
+did. Nothing is ever sent anywhere, and `ROCQ_LIVE_STATS=0` turns the log
+off.
+
+```
+$ rocq-live stats --since 7d
+rocq-live stats: 21 request(s) on 4 file(s) since 2026-11-10 01:01
+  time    8 whole-file check(s) took 1.4 s; full re-checks would have taken about 88.7 s (from each file's last full run) -> ~87.3 s saved; 3 more with no full run to compare
+  work    402 sentence(s) run (whole-file checks: 397 of 1,551, 26%); 86 checked proof(s) kept instead of re-run; 0 proof(s) skipped by fast replay
+  errors  check --all-errors: 2 call(s) found 3 error(s), 2 more than one per call
+  tokens  compact goals left out 84 characters of unchanged hypotheses (~21 tokens)
+  hints   3 name hint(s): 3 similar loaded name(s), 0 in a library to Require, 0 with nothing similar
+  impact  2 run(s): 6 file(s) compiled, 2 failed, 2 skipped
+  calls   check 12 (median 0.2 s, 3 errors), run 3 (median 0.1 s, 2 errors), impact 2 (median 0.1 s, 1 error), goto 1 (median 0.1 s), ...
+          via cli 21; over 19.0 s; log: ~/.cache/rocq-live/stats.jsonl
+```
+
+The time saved is an estimate. Each whole-file check (`check`, or `goto`
+with no line) is compared with the most recent full run of the same file,
+one that re-ran every sentence, scaled by the file's current size. That full
+run costs about what `coqc` does. The times are rocq-live's own work, without
+the client's process start. "More than one per call" counts the extra
+errors `--all-errors` found, each a round an agent did not need. The token
+estimate assumes about four characters per token. Give a FILE to see one
+file only.
 
 ## Project detection
 
@@ -397,6 +441,7 @@ rocq-live cannot know where its `.vo` files go.
 | `ROCQ_LIVE_REUSE`   | `0`: after an edit inside a proof, re-run every proof after it    |
 | `ROCQ_LIVE_JOBS`    | files `impact` compiles at once (default: half the cores, at most 4) |
 | `ROCQ_LIVE_COMPACT` | `0`: `run` and `try` show every hypothesis, not just the changed ones |
+| `ROCQ_LIVE_STATS`   | `0`: keep no stats log (`ROCQ_LIVE_STATS_FILE`: another path for it) |
 | `ROCQ_LIVE_DAEMON`  | `0`: no background process (see [Recipes](https://github.com/kylezh/rocq-live#recipes-and-the-no-daemon-mode)) |
 
 The session limits below can also be set in the environment.
