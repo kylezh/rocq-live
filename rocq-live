@@ -18,16 +18,22 @@
                                       which work, goals left; state unchanged
   rocq-live audit FILE [NAME..] [--allow AX,..]  Admitted/admit/axioms and
                                       Print Assumptions vs the allowed axioms
-  rocq-live check FILE [--allow-stale] [--rebuild]  coqc's verdict on the whole
+  rocq-live check FILE [--allow-stale] [--rebuild] [--all-errors]  coqc's verdict on the whole
                                       file (errors in coqc's format, exit 0 OK, 1
                                       error, 2 not checked), from the live session:
                                       re-checks only what an edit can affect (a
                                       Qed proof's tactics: that proof; a statement,
                                       definition or instance: the proofs that can
                                       see it). Refuses
-                                      (exit 2) if a dependency's .vo is out of date
+                                      (exit 2) if a dependency's .vo is out of date.
+                                      --all-errors: every failing proof, not just
+                                      the first error
   rocq-live compile FILE [--deps-only] write .vo files with the project's build
                                       step: out-of-date dependencies, then FILE
+  rocq-live impact FILE               what an edit to FILE breaks elsewhere: compile
+                                      FILE and every file that requires it, in order
+                                      and in parallel (ROCQ_LIVE_JOBS); a failure
+                                      skips what depends on it
   rocq-live back  FILE [N]            undo the last N runs (default 1)
   rocq-live goals FILE                print the current goals
   rocq-live start FILE [LINE]         like goto, but always a fresh session
@@ -76,6 +82,7 @@ ROCQ_LIVE_TIMEOUT (seconds per step; default 600 for goto/start, 120 others),
 ROCQ_LIVE_TRY_TIMEOUT (seconds per tactic in `try`; default 30),
 ROCQ_LIVE_FAST=0 (goto checks every proof, as --full),
 ROCQ_LIVE_REUSE=0 (after an edit inside a proof, re-run every proof after it),
+ROCQ_LIVE_COMPACT=0 (run/try show every hypothesis, not only the changed ones),
 ROCQ_LIVE_DAEMON=0 (no background process: each call starts coqtop, rebuilds
 the state from the recipe and exits; slower per call, nothing left running).
 
@@ -115,6 +122,7 @@ LOG_KEEP = 86400            # the log of a dead session is kept this long (debug
 RECIPE_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"),
                           "rocq-live", "recipes")
 RECIPE_KEEP = 7 * 86400     # a session's recipe (line + runs) is kept this long
+MAX_ERRORS = 50             # check --all-errors reports at most this many
 WATCH_EVERY = 1.0           # seconds between memory checks while a step runs
 GRACE_MEMORY = 5            # after an interrupt for memory, wait this long, then kill coqtop
 GRACE_TIMEOUT = 20          # same, after an interrupt for time
@@ -1339,31 +1347,28 @@ def built_ns(v):
     return t
 
 
-def stale_deps(path, proj):
-    """[(.v, why)] of the libraries FILE requires (transitively) that make
-    would rebuild: no .vo, a .vo older than its .v, or older than a .vo it
-    requires; in build order. [] for dune projects (resolve just built them)
-    or when it cannot be told (no coqdep)."""
-    if proj["kind"] == "dune":
-        return []
-    try:
-        graph = dep_graph(proj, path)
-    except (OSError, ValueError, subprocess.SubprocessError):
-        return []
-    if not graph:
-        return []
-    order, seen, root = [], set(), proj["root"]
-    stack = [(d, False) for d in reversed(graph.get(path, []))]
+def build_order(graph, roots):
+    """`roots` and the files they require (transitively, through `graph`),
+    each after what it requires."""
+    order, seen = [], set()
+    stack = [(r, False) for r in reversed(list(roots))]
     while stack:                       # post-order: dependencies first
         v, expanded = stack.pop()
         if expanded:
             order.append(v)
             continue
-        if v in seen or v == path:
+        if v in seen:
             continue
         seen.add(v)
         stack.append((v, True))
         stack.extend((d, False) for d in reversed(graph.get(v, [])) if d not in seen)
+    return order
+
+
+def outdated(graph, order, root):
+    """{.v: why} of the files in `order` (dependencies first) that make would
+    rebuild: no .vo, a .vo older than its .v, or older than a .vo it
+    requires (or requiring one that is itself out of date)."""
     why = {}
     for v in order:
         rel, t = os.path.relpath(v, root), built_ns(v)
@@ -1380,6 +1385,23 @@ def stale_deps(path, proj):
                 if td and td > t:
                     why[v] = "%s's .vo is older than %s's, which it requires" % (rel, os.path.relpath(d, root))
                     break
+    return why
+
+
+def stale_deps(path, proj):
+    """[(.v, why)] of the libraries FILE requires (transitively) that make
+    would rebuild, in build order. [] for dune projects (resolve just built
+    them) or when it cannot be told (no coqdep)."""
+    if proj["kind"] == "dune":
+        return []
+    try:
+        graph = dep_graph(proj, path)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return []
+    if not graph:
+        return []
+    order = [v for v in build_order(graph, [path]) if v != path]
+    why = outdated(graph, order, proj["root"])
     return [(v, why[v]) for v in order if why.get(v)]
 
 
@@ -1421,7 +1443,7 @@ def compile_cmd(proj, v):
             ["rocq", "compile"] if shutil.which("rocq", path=env.get("PATH")) else None)
     if not tool:
         raise Fail("rocq-live: no coqc (or rocq) found to compile with")
-    return tool + proj["flags"] + [v], False, root
+    return tool + proj["flags"] + [os.path.relpath(v, root)], False, root
 
 
 def build(path, proj, deps_only):
@@ -1443,6 +1465,126 @@ def build(path, proj, deps_only):
         return ("rocq-live: dependencies up to date (dune builds them)" if proj["kind"] == "dune"
                 else "rocq-live: dependencies up to date"), False
     return "rocq-live: compiled %s (%.1f s)" % (", ".join(done), time.time() - t0), False
+
+
+def source_flags(proj):
+    """The load path with dune's build copies (_build/default/...) mapped
+    back to the source directories, so coqdep reads the files you edit."""
+    root = os.path.realpath(proj["root"])
+    b = os.path.join(root, "_build", "default")
+    out, i, fl = [], 0, proj["flags"]
+    while i < len(fl):
+        if fl[i] in ("-Q", "-R") and i + 2 < len(fl):
+            d = os.path.realpath(fl[i + 1])
+            if d == b or d.startswith(b + os.sep):
+                src = root + d[len(b):]
+                d = src if os.path.isdir(src) else d
+            out += [fl[i], d, fl[i + 2]]
+            i += 3
+        else:
+            out.append(fl[i])
+            i += 1
+    return out
+
+
+def compile_one(proj, v):
+    """("ok", seconds) or ("failed", output) for building v's .vo."""
+    t0 = time.time()
+    cmd, shell, cwd = compile_cmd(proj, v)
+    r = subprocess.run(cmd, shell=shell, cwd=cwd, env=proj["env"], capture_output=True, text=True)
+    if r.returncode:
+        return "failed", (r.stdout + r.stderr).strip()
+    return "ok", time.time() - t0
+
+
+def compile_jobs():
+    try:
+        return max(1, int(os.environ.get("ROCQ_LIVE_JOBS", "")))
+    except ValueError:
+        return max(1, min(4, (os.cpu_count() or 2) // 2))
+
+
+def impact(file):
+    """Compile FILE, then every project file that requires it (directly or
+    not), in dependency order and in parallel, rebuilding on the way any
+    out-of-date file they need: what an edit to FILE breaks elsewhere. A
+    failure skips what depends on it; other branches go on. dune projects:
+    one `dune build` of those targets."""
+    import concurrent.futures as cf
+    path = norm(file)
+    proj = resolve(path)
+    root, t0 = proj["root"], time.time()
+    dune = proj["kind"] == "dune" and not proj.get("compile")
+    sproj = dict(proj, flags=source_flags(proj)) if proj["kind"] == "dune" else proj
+    graph = dep_graph(sproj, path)
+    if graph is None:
+        raise Fail("rocq-live: impact needs coqdep (or rocq dep) to find the files that require FILE")
+    users = {}
+    for v, ds in graph.items():
+        for d in ds:
+            users.setdefault(d, []).append(v)
+    cone, stack = set(), [path]
+    while stack:
+        for w in users.get(stack.pop(), []):
+            if w not in cone and w != path:
+                cone.add(w)
+                stack.append(w)
+    rel = os.path.relpath(path, root)
+    head = "rocq-live impact %s: %d file(s) require it" % (rel, len(cone))
+    targets = [v for v in build_order(graph, [path] + sorted(cone)) if v in cone or v == path]
+    if dune:
+        vos = [os.path.relpath(v[:-2] + ".vo", root) for v in targets]
+        r = subprocess.run(["dune", "build", "--display=quiet"] + vos, cwd=root, env=proj["env"],
+                           capture_output=True, text=True)
+        listed = "\n".join("  " + os.path.relpath(v, root) for v in targets)
+        out = (r.stdout + r.stderr).strip()
+        verdict = "all built" if r.returncode == 0 else "dune build failed (exit %d)" % r.returncode
+        return ("%s\n%s%s\nrocq-live: %s [%.1f s]" % (head, listed, "\n" + out if out else "", verdict,
+                                                     time.time() - t0)), r.returncode != 0
+    # what to build: FILE, the files that require it, and anything out of
+    # date that they require
+    needed = set(targets)
+    order = build_order(graph, needed)
+    why = outdated(graph, order, root)
+    needed |= {v for v in order if why.get(v)}
+    order = [v for v in build_order(graph, sorted(needed)) if v in needed]
+    results, running, pending, jobs = {}, {}, list(order), compile_jobs()
+    with cf.ThreadPoolExecutor(jobs) as ex:
+        while pending or running:
+            for v in list(pending):
+                deps = [d for d in graph.get(v, []) if d in needed]
+                blocked = [d for d in deps if results.get(d, ("",))[0] in ("failed", "skipped")]
+                if blocked:
+                    results[v] = ("skipped", blocked[0])
+                    pending.remove(v)
+                elif len(running) < jobs and all(results.get(d, ("",))[0] == "ok" for d in deps):
+                    running[ex.submit(compile_one, proj, v)] = v
+                    pending.remove(v)
+            if running:
+                done, _ = cf.wait(list(running), return_when=cf.FIRST_COMPLETED)
+                for fut in done:
+                    results[running.pop(fut)] = fut.result()
+            elif pending:                           # not in a DAG; never spin
+                for v in pending:
+                    results[v] = ("skipped", None)
+                pending = []
+    lines, counts = [head], {"ok": 0, "failed": 0, "skipped": 0}
+    for v in order:
+        state, info = results[v]
+        counts[state] += 1
+        r_ = os.path.relpath(v, root)
+        extra = "" if v == path or v in cone else "  (out of date, needed)"
+        if state == "ok":
+            lines.append("ok       %s (%.1f s)%s" % (r_, info, extra))
+        elif state == "failed":
+            lines.append("FAILED   %s%s\n%s" % (r_, extra, info))
+        else:
+            lines.append("skipped  %s (requires %s, which %s)" % (
+                r_, os.path.relpath(info, root) if info else "?",
+                "failed" if results.get(info, ("",))[0] == "failed" else "was skipped"))
+    lines.append("rocq-live: %d compiled, %d failed, %d not checked [%.1f s, %d job(s)]"
+                 % (counts["ok"], counts["failed"], counts["skipped"], time.time() - t0, jobs))
+    return "\n".join(lines), bool(counts["failed"] or counts["skipped"])
 
 
 # ------------------------------------------------- recipes
@@ -1480,6 +1622,108 @@ def drop_recipe(path):
         pass
 
 
+# ------------------------------------------------- suggestions and compact goals
+
+MISSING = re.compile(r"The\s+(?:reference|variable)\s+(\S+?)\s+was\s+not\s+found\s+in\s+the\s+current\s+environment")
+SUGGEST_BUDGET = 8          # seconds of Search per error, looking for similar names
+
+
+def parse_search(out):
+    """[(name, type on one line)] from `Search` output."""
+    entries = []
+    for line in out.splitlines():
+        m = re.match(r"^([^\s:][^\s]*?):(?:\s(.*))?$", line)
+        if m:
+            entries.append([m.group(1), (m.group(2) or "").strip()])
+        elif entries and line.strip():
+            entries[-1][1] = (entries[-1][1] + " " + line.strip()).strip()
+    return entries
+
+
+def name_parts(name):
+    return [t for t in re.split(r"[_'.]+", name.split(".")[-1].lower()) if t]
+
+
+def name_score(name, cand):
+    """How alike two names are: their parts matched up fuzzily (so a typo or
+    parts in another order still score high), then the last components as
+    strings, then a shared qualifier."""
+    import difflib
+    ratio = lambda a, b: difflib.SequenceMatcher(None, a, b).ratio()
+    ps, qs = name_parts(name), name_parts(cand)
+    if not ps or not qs:
+        return 0.0
+    parts = sum(max(ratio(p, q) for q in qs) for p in ps) / len(ps)
+    parts *= min(len(ps), len(qs)) / max(len(ps), len(qs))
+    whole = ratio(name.split(".")[-1].lower(), cand.split(".")[-1].lower())
+    qual = name.rsplit(".", 1)[0] if "." in name else None
+    same_qual = 0.05 if qual and cand.rsplit(".", 1)[0].endswith(qual) else 0.0
+    return max(parts, whole) + same_qual
+
+
+def rank_names(name, found, n=5):
+    """The names in `found` most like `name`."""
+    scored = sorted(((name_score(name, c), c) for c in found if c != name), key=lambda x: (-x[0], len(x[1])))
+    return [c for sc, c in scored if sc >= 0.6][:n]
+
+
+GOAL_HEAD = re.compile(r"^\d+ (?:focused )?goals?\b")
+GOAL_RULE = re.compile(r"^\s*={4,}\s*$")
+
+
+def parse_goal(text):
+    """(lines up to the first goal's header, its hypotheses, lines from the
+    ==== rule on) of a goals display, or None. A hypothesis starts at a line
+    indented by two spaces; deeper lines continue it."""
+    lines = text.split("\n")
+    head = next((i for i, l in enumerate(lines) if GOAL_HEAD.match(l)), None)
+    if head is None:
+        return None
+    rule = next((i for i in range(head + 1, len(lines)) if GOAL_RULE.match(lines[i])), None)
+    if rule is None:
+        return None
+    hyps = []
+    for line in lines[head + 1:rule]:
+        if re.match(r"^  \S", line):
+            hyps.append([line])
+        elif hyps and line.strip():
+            hyps[-1].append(line)
+    return lines[:head + 1], ["\n".join(h) for h in hyps], lines[rule:]
+
+
+def compact_enabled():
+    return os.environ.get("ROCQ_LIVE_COMPACT", "1") != "0"
+
+
+def hyp_name(entry):
+    return entry[2:].split(" :")[0].strip()
+
+
+def compact_goals(shown, text):
+    """`text` (a goals display) with the first goal's hypotheses that are
+    unchanged from `shown` (the hypotheses last displayed) replaced by one
+    line naming them; `text` itself if that saves little."""
+    if not shown:
+        return text
+    parsed = parse_goal(text)
+    if not parsed:
+        return text
+    head, hyps, rest = parsed
+    before = set(shown)
+    same = [h for h in hyps if h in before]
+    if len(same) < 3:
+        return text
+    names = [n.strip() for h in same for n in hyp_name(h).split(",")]
+    listed = ", ".join(names[:25]) + (", ..." if len(names) > 25 else "")
+    now = {n.strip() for h in hyps for n in hyp_name(h).split(",")}
+    gone = [n.strip() for h in shown for n in hyp_name(h).split(",") if n.strip() not in now]
+    out = head + ["  (%d unchanged hypotheses not shown: %s)" % (len(names), listed)]
+    out += [h for h in hyps if h not in before]
+    if gone:
+        out.append("  (no longer in context: %s)" % ", ".join(gone[:25]))
+    return "\n".join(out + rest)
+
+
 # --------------------------------------------------------------- session
 
 class Session:
@@ -1510,6 +1754,8 @@ class Session:
         self.coq = Coqtop(p["cmd"], p["flags"], p["root"], p["env"])
         self.coq.watch = self.watch
         self.done, self.runs, self.skipped = [(0, self.coq.state)], [], []
+        self.shown = None          # hypotheses of the goal last displayed (compact goals)
+        self.compact = compact_enabled()
 
     def note_loaded(self):
         out, _ = self.coq.send("Print Libraries.")
@@ -1561,7 +1807,7 @@ class Session:
     def line_of(self, off):
         return self.text.count("\n", 0, off) + 1
 
-    def goto(self, line, full=False, strict=False):
+    def goto(self, line, full=False, strict=False, all_errors=False):
         """State just before `line` (0: end of file). Re-checks from the first
         changed character, except what the change cannot affect:
         - an edit to comments or white space between sentences re-runs nothing;
@@ -1571,7 +1817,10 @@ class Session:
           only the statement.
         Unless `full`, a finished Qed proof before the target that was not
         edited is taken as Admitted as well (statement checked, tactics not),
-        as `coqc -vos` does. `strict` (audit) runs every proof for real."""
+        as `coqc -vos` does. `strict` (audit) runs every proof for real.
+        With `all_errors`, an error inside an opaque proof is recorded in
+        `errors` and the proof is closed with Admitted, so checking goes on
+        (up to MAX_ERRORS); an error anywhere else still stops."""
         with open(self.path, encoding="utf-8") as f:
             new = f.read()
         target = line_offset(new, line) if line else len(new)
@@ -1608,14 +1857,15 @@ class Session:
         blank = depths = None
         msgs, failed, off, skipped_now = [], False, self.done[-1][0], 0
         self.error, self.sent, self.reused = None, 0, 0   # error: (start offset, text sent, output)
-        opening = None                    # (statement start, proof end) of the proof being run
+        self.errors = []                  # with all_errors: errors in proofs closed with Admitted
+        opening = None                    # (statement start, proof end, statement end) of the proof being run
         if off and off < target:          # resuming inside a proof? it counts once its Qed runs
             blank = blank_comments(new)
             depths = section_depths(blank) if fast or reuse else {}
             st = statement_before(blank, [e for e, _ in self.done])
             ext = proof_extent(new, blank, *st) if st else None
             if ext and st[1] <= off < ext["stop"]:
-                opening = (st[0], ext["stop"])
+                opening = (st[0], ext["stop"], st[1])
         while True:
             end = next_sentence_end(new, off)
             if end is None or end > target:
@@ -1665,7 +1915,18 @@ class Session:
                 elif opening is None:
                     ext = proof_extent(new, blank, off, end)
                     if ext:
-                        opening = (off, ext["stop"])
+                        opening = (off, ext["stop"], end)
+            if err and all_errors and opening and len(self.errors) < MAX_ERRORS \
+                    and "rocq-live: step interrupted" not in out:
+                # inside a proof: note the error, close the proof with Admitted, go on
+                self.coq.back_to(self.done[-1][1])
+                _, bad = self.coq.send("Admitted.")
+                if not bad:
+                    self.errors.append(self.error)
+                    self.done.append((opening[1], self.coq.state))
+                    self.skipped.append((opening[2], opening[1], False))
+                    off, opening = opening[1], None
+                    continue
             if err:
                 at = self.line_of(off + len(new[off:end]) - len(new[off:end].lstrip()))
                 self.coq.back_to(self.done[-1][1])
@@ -1675,7 +1936,7 @@ class Session:
                 break
             self.done.append((end, self.coq.state))
             if opening and end == opening[1]:
-                self.checked.add(opening)        # its Qed/Admitted went through
+                self.checked.add(opening[:2])    # its Qed/Admitted went through
                 opening = None
             off = end
         self.note_loaded()
@@ -1746,11 +2007,15 @@ class Session:
         elif cmd == "audit":
             res = self.audit(arg.get("names") or [], arg.get("allow") or self.proj.get("axioms") or [])
         elif cmd == "check":
-            res = self.check(arg.get("name") or self.name)
+            res = self.check(arg.get("name") or self.name, bool(arg.get("all_errors")))
         else:
             return "rocq-live: unknown command " + cmd, True
         if cmd in ("goto", "run", "back", "audit", "check"):
             save_recipe(self.path, self.line, [t for _, t in self.runs])
+        if res[1] and cmd in ("goto", "run", "query", "try", "check") and MISSING.search(res[0]):
+            hints = self.suggest(res[0])
+            if hints:
+                res = (res[0] + "\n" + "\n".join(hints), res[1])
         return res
 
     def run(self, text):
@@ -1763,7 +2028,9 @@ class Session:
             return out + "\nrocq-live: error; state unchanged", True
         self.runs.append((before, text))
         self.note_loaded()
-        return out or self.goals(), False
+        if not out:
+            out, _ = self.coq.send("Show.")
+        return self.display(out, compact=True), False
 
     def query(self, text):
         before = self.coq.state
@@ -1781,7 +2048,54 @@ class Session:
 
     def goals(self):
         out, err = self.coq.send("Show.")
-        return "(no open proof)" if err or not out else out
+        return self.display("(no open proof)" if err or not out else out)
+
+    def display(self, text, compact=False):
+        """A goals display for the client: compacted against the goals last
+        shown if `compact` (see compact_goals); remembers its hypotheses."""
+        out = compact_goals(self.shown, text) if compact and self.compact else text
+        parsed = parse_goal(text)
+        self.shown = parsed[1] if parsed else None
+        return out
+
+    def suggest(self, text):
+        """Hints for names an error says do not exist: similar names that do
+        (with their types), found by Search in the current state."""
+        names = []
+        for m in MISSING.finditer(text):
+            n = m.group(1).rstrip(".")
+            if n not in names:
+                names.append(n)
+        lines, timeout = [], self.coq.timeout
+        deadline = time.time() + SUGGEST_BUDGET
+        for name in names[:3]:
+            base = name.split(".")[-1]
+            if len(base) < 4:
+                continue
+            found = {}
+            parts = [t for t in re.split(r"[_']+", base) if len(t) >= 3]
+            queries = ['Search "%s".' % base]                  # a longer name, another module
+            if len(parts) >= 2:                                 # the same parts, another order
+                queries.append("Search %s." % " ".join('"%s"' % t for t in parts))
+            queries += ['Search "%s".' % t for t in parts]      # a typo in one part
+            try:
+                for q in queries:
+                    left = deadline - time.time()
+                    if left < 0.5 or len(rank_names(name, found)) >= 3:
+                        break
+                    self.coq.timeout = left
+                    out, err = self.query(q)
+                    if not err:
+                        for n_, t in parse_search(out):
+                            found.setdefault(n_, t)
+            finally:
+                self.coq.timeout = timeout
+            best = rank_names(name, found)
+            if best:
+                lines.append("rocq-live hint: %s does not exist here; similar names:" % name)
+                lines += ["  %s : %s" % (c, found[c][:160] + (" ..." if len(found[c]) > 160 else ""))
+                          for c in best]
+        return lines
 
     def try_(self, tactics, each_timeout):
         """Run each tactic alone on the current state, then undo it: which
@@ -1798,7 +2112,9 @@ class Session:
             finally:
                 self.coq.timeout = timeout
             if not err and not out:
-                out = self.goals()
+                out, _ = self.coq.send("Show.")
+            if not err and self.compact:
+                out = compact_goals(self.shown, out)
             self.coq.back_to(before)
             rows.append((i, tac, None if err else goal_count(out), out))
         ok = [r for r in rows if r[2] is not None]
@@ -1872,29 +2188,43 @@ class Session:
                 break
         return "\n".join(rep_), verdict == "FAIL"
 
-    def check(self, name):
+    def check(self, name, all_errors=False):
         """coqc's verdict on the whole file: every proof checked (nothing taken
         as Admitted), the first error in coqc's format, and coqc's end-of-file
-        rules (no open proof, Section or Module). Only the text from the first
-        change since the last goto/check is re-run. The session stays at the
-        end of the file, or before the error, so the next check after a fix
-        starts there. Error code 1: the file does not check; 2: not checked."""
+        rules (no open proof, Section or Module). Only what changed since the
+        last goto/check can affect is re-run. The session stays at the end of
+        the file, or before the error, so the next check after a fix starts
+        there. With `all_errors`, every proof that fails is reported (each
+        closed with Admitted to go on); an error outside a proof still stops.
+        Error code 1: the file does not check; 2: not checked."""
         t0 = time.time()
-        out, failed = self.goto(0, full=True)
+        out, failed = self.goto(0, full=True, all_errors=all_errors)
         total = count_sentences(self.text)
         if failed and self.error is None:
             return out + "\nrocq-live: %s NOT CHECKED" % name, 2
         if failed and "rocq-live: step interrupted" in self.error[2]:
             return ("%s\nrocq-live: %s NOT CHECKED: the check was interrupted (see above)"
                     % (self.error[2], name)), 2
-        diag = coqc_diag(self.text, self.error, name) if failed else self.eof_error(name)
+        diags = [coqc_diag(self.text, e, name) for e in self.errors]
+        last = coqc_diag(self.text, self.error, name) if failed else self.eof_error(name)
+        if last:
+            diags.append(last)
         stats = "[%s%s, %.1f s]" % ("all %d sentences run" % total if self.sent >= total else
                                     "%d of %d sentences re-run" % (self.sent, total),
                                     ", %d proof(s) checked before kept" % self.reused if self.reused else "",
                                     time.time() - t0)
-        if diag:
-            return "%s\nrocq-live: %s FAILED %s" % (diag, name, stats), 1
-        return "rocq-live: %s OK %s" % (name, stats), False
+        if not diags:
+            return "rocq-live: %s OK %s" % (name, stats), False
+        note = ""
+        if all_errors:
+            note = " %d error(s)" % len(diags)
+            if self.errors:
+                note += "; %d failing proof(s) closed with Admitted to go on" % len(self.errors)
+            if len(self.errors) >= MAX_ERRORS:
+                note += "; stopped after %d" % MAX_ERRORS
+            elif failed:
+                note += "; stopped at an error outside a proof"
+        return "%s\nrocq-live: %s FAILED%s %s" % ("\n".join(diags), name, note, stats), 1
 
     def eof_error(self, name):
         """coqc's error at the end of a file that leaves a proof, Section or
@@ -2027,6 +2357,7 @@ def serve(path, sock, projfile):
                     session.coq.timeout, session.coq.why = TIMEOUT_GOTO, None
                     note = session.before(cmd, req.get("proj"))
                     session.coq.timeout = req.get("timeout", TIMEOUT_GOTO)
+                    session.compact = req.get("compact", True)
                     out, err = session.handle(cmd, arg)
                     # memory: a step that was stopped for memory, or a coqtop
                     # still over the per-session limit, keeps its heap: restart
@@ -2228,7 +2559,7 @@ def request(sock, cmd, arg=None, proj=None):
     timeout = float(os.environ.get("ROCQ_LIVE_TIMEOUT", default))
     c = socket.socket(socket.AF_UNIX)
     c.connect(sock)
-    msg = {"cmd": cmd, "arg": arg, "timeout": timeout}
+    msg = {"cmd": cmd, "arg": arg, "timeout": timeout, "compact": compact_enabled()}
     if proj:
         msg["proj"] = proj
     c.sendall((json.dumps(msg) + "\n").encode())
@@ -2293,7 +2624,7 @@ def goto(file, line=0, full=False):
     return (note + "\n" + out if note else out), err
 
 
-def check(file, allow_stale=False, rebuild=False):
+def check(file, allow_stale=False, rebuild=False, all_errors=False):
     """coqc's verdict on FILE from its live session (see Session.check).
     Error code 1: FILE does not check; 2: it was not checked (a dependency
     is out of date or does not build, or no session)."""
@@ -2320,7 +2651,7 @@ def check(file, allow_stale=False, rebuild=False):
     if stale:
         notes.append("rocq-live: warning: checking against out-of-date dependencies (--allow-stale):\n"
                      + stale_list(stale))
-    arg = {"name": name}
+    arg = {"name": name, "all_errors": all_errors}
     if not daemon_enabled():
         out, err = local("check", path, arg, proj=proj)
     else:
@@ -2592,7 +2923,10 @@ TOOLS = [
      ["file"]),
     ("rocq_run", "Run tactics/commands (complete sentences ending in '.') on top of the "
      "session's current state and return the new goals or the error. An error leaves the "
-     "state unchanged. Use to try tactics without editing the file; rocq_back undoes.",
+     "state unchanged. Use to try tactics without editing the file; rocq_back undoes. "
+     "Hypotheses unchanged since the goals last shown are summarized in one line naming "
+     "them (rocq_goals shows everything). An error about a name that does not exist comes "
+     "with similar names that do, and their types.",
      {"file": ("string", FILE_DOC), "text": ("string", "Sentences, e.g. 'intros x. simpl.'"),
       "line": ("integer", "Optional: first go to the state before this line (as rocq_goto).")},
      ["file", "text"]),
@@ -2627,7 +2961,10 @@ TOOLS = [
      "Refuses, without checking, when a dependency's .vo is out of date (its .v was edited "
      "since): then rocq_compile with deps_only, or allow_stale. Writes no .vo (rocq_compile does).",
      {"file": ("string", FILE_DOC),
-      "allow_stale": ("boolean", "Check against out-of-date dependencies anyway (their old .vo).")},
+      "allow_stale": ("boolean", "Check against out-of-date dependencies anyway (their old .vo)."),
+      "all_errors": ("boolean", "Report every proof that fails, not just the first error (each "
+                     "failing proof is closed with Admitted to go on; an error outside a proof still "
+                     "stops). Use it after a change that may break several proofs.")},
      ["file"]),
     ("rocq_compile", "Build .vo files with the project's own build step (coqc with the load "
      "path, dune, or `compile` in .rocq-live): first FILE's out-of-date dependencies in "
@@ -2637,6 +2974,12 @@ TOOLS = [
      {"file": ("string", FILE_DOC),
       "deps_only": ("boolean", "Only rebuild FILE's out-of-date dependencies, not FILE.")},
      ["file"]),
+    ("rocq_impact", "Find what an edit to FILE breaks in other files: compile FILE, then every "
+     "project file that requires it (directly or not), in dependency order and in parallel, "
+     "rebuilding any out-of-date file they need. Reports each file as ok, FAILED (with coqc's "
+     "errors) or skipped (it requires one that failed). Use it after changing a statement or "
+     "definition other files use. Writes .vo files, as a build does.",
+     {"file": ("string", FILE_DOC)}, ["file"]),
     ("rocq_back", "Undo the last N rocq_run calls (default 1) and show the goals.",
      {"file": ("string", FILE_DOC), "n": ("integer", "How many runs to undo.")}, ["file"]),
     ("rocq_goals", "Show the current goals of FILE's session.",
@@ -2655,9 +2998,10 @@ def tool_list():
     for name, desc, props, req in TOOLS:
         # hints for clients' approval rules: no tool edits source files (a
         # goto may build the project's imports, as a build would); only
-        # rocq_compile exists to write files (.vo)
+        # rocq_compile and rocq_impact exist to write files (.vo)
         out.append({"name": name, "description": desc,
-                    "annotations": {"readOnlyHint": name != "rocq_compile", "destructiveHint": False,
+                    "annotations": {"readOnlyHint": name not in ("rocq_compile", "rocq_impact"),
+                                    "destructiveHint": False,
                                     "idempotentHint": name in ("rocq_goals", "rocq_sessions", "rocq_info", "rocq_try"),
                                     "openWorldHint": False},
                     "inputSchema": {
@@ -2683,9 +3027,11 @@ def call_tool(name, a):
     if name == "rocq_audit":
         return safe(audit, f, a.get("names") or [], a.get("allow") or [])
     if name == "rocq_check":
-        return safe(check, f, bool(a.get("allow_stale")))
+        return safe(check, f, bool(a.get("allow_stale")), False, bool(a.get("all_errors")))
     if name == "rocq_compile":
         return safe(compile_, f, bool(a.get("deps_only")))
+    if name == "rocq_impact":
+        return safe(impact, f)
     if name == "rocq_back":
         return safe(back, f, int(a.get("n") or 1))
     if name == "rocq_goals":
@@ -2815,16 +3161,18 @@ def main(argv):
                 names.append(rest[0]); rest = rest[1:]
         out, err = safe(audit, args[0], names, allow)
     elif cmd == "check" and args:
-        opts = {"--allow-stale", "--rebuild"}
+        opts = {"--allow-stale", "--rebuild", "--all-errors"}
         rest = [x for x in args if x not in opts]
         if len(rest) != 1:
             print(usage, file=sys.stderr); return 2
-        out, err = safe(check, rest[0], "--allow-stale" in args, "--rebuild" in args)
+        out, err = safe(check, rest[0], "--allow-stale" in args, "--rebuild" in args, "--all-errors" in args)
     elif cmd == "compile" and args:
         rest = [x for x in args if x != "--deps-only"]
         if len(rest) != 1:
             print(usage, file=sys.stderr); return 2
         out, err = safe(compile_, rest[0], "--deps-only" in args)
+    elif cmd == "impact" and len(args) == 1:
+        out, err = safe(impact, args[0])
     elif cmd in ("start", "goto") and args:
         full = "--full" in args
         f, line, rest = split_file_line([x for x in args if x != "--full"])

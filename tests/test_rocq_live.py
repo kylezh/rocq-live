@@ -136,6 +136,7 @@ class Project(unittest.TestCase):
         self.assertIn("rocq_goto", tools)
         self.assertTrue(tools["rocq_check"]["annotations"]["readOnlyHint"])
         self.assertFalse(tools["rocq_compile"]["annotations"]["readOnlyHint"])   # writes .vo
+        self.assertFalse(tools["rocq_impact"]["annotations"]["readOnlyHint"])
         self.assertFalse(got[3]["result"]["isError"])
         self.assertIn("double n = 2 * n", got[3]["result"]["content"][0]["text"])
         self.assertIn("n + n = 2 * n", got[4]["result"]["content"][0]["text"])   # in order
@@ -478,6 +479,84 @@ class Project(unittest.TestCase):
         self.write("Def.v", text.replace("Definition k := 1.", "Definition k := 2."))
         out = sh("check", f, code=1)                       # c computes with k: re-run, fails
         self.assertIn("6 proof(s) checked before kept", out)
+        sh("stop", f)
+
+    def test_l_check_all_errors(self):
+        """--all-errors reports every failing proof; each error is the one
+        coqc reports when that proof is the only broken one."""
+        def text(broken):
+            out = ["Lemma p%d : %d = %d.\nProof.\n  %s\nQed.\n"
+                   % (i, i, i, "exact (eq_refl %d)." % (i + 100) if i in broken else "reflexivity.")
+                   for i in range(6)]
+            return "".join(out) + "Lemma uses : 1 = 1.\nProof.\n  exact p1.\nQed.\n"   # p1 broken: fine
+        rel = "theories/AllErr.v"
+        coqc = self.coqc()
+        want = []
+        for i in (1, 3, 4):
+            self.write("AllErr.v", text({i}))
+            r = subprocess.run(coqc + ["-Q", "theories", "My", rel], cwd=self.dir, capture_output=True, text=True)
+            want += [l for l in (r.stdout + r.stderr).splitlines() if l.strip()]
+        self.write("AllErr.v", text({1, 3, 4}))
+        first = sh("check", rel, cwd=self.dir, code=1)
+        self.assertEqual(first.count("File "), 1)                     # coqc's: the first error only
+        out = sh("check", rel, "--all-errors", cwd=self.dir, code=1)
+        got = [l for l in out.splitlines() if l.strip() and not l.startswith("rocq-live")]
+        self.assertEqual(got, want)
+        self.assertIn("3 error(s); 3 failing proof(s) closed with Admitted to go on", out)
+        self.write("AllErr.v", text(set()))
+        self.assertIn("OK", sh("check", rel, "--all-errors", cwd=self.dir, code=0))
+        # an error outside a proof stops, after the proof errors before it
+        self.write("AllErr.v", text({1}) + "Definition bad := undefined_name.\nLemma z : True.\nProof.\n  exact 7.\nQed.\n")
+        out = sh("check", rel, "--all-errors", cwd=self.dir, code=1)
+        self.assertEqual(out.count("File "), 2)
+        self.assertIn("stopped at an error outside a proof", out)
+        sh("stop", os.path.join(self.dir, rel))
+
+    def test_m_impact(self):
+        d = os.path.join(self.dir, "theories")
+        self.write("I1.v", "Definition i := 1.\nLemma i_eq : i = 1.\nProof. reflexivity. Qed.\n")
+        self.write("IOther.v", "Definition other := 0.\n")                       # never built
+        self.write("I2.v", "From My Require Import I1 IOther.\nLemma i2 : i = 1.\nProof. exact i_eq. Qed.\n")
+        self.write("I3.v", "From My Require Import I2.\nLemma i3 : True.\nProof. exact I. Qed.\n")
+        self.write("I4.v", "From My Require Import I1.\nLemma i4 : i + i = 2.\nProof. reflexivity. Qed.\n")
+        self.write("I5.v", "From My Require Import I4.\nLemma i5 : True.\nProof. exact I. Qed.\n")
+        self.write("I6.v", "Definition unrelated := 6.\n")
+        out = sh("impact", os.path.join(d, "I1.v"), code=0)
+        self.assertIn("4 file(s) require it", out)
+        self.assertIn("ok       theories/IOther.v", out)                  # out of date, needed by I2
+        self.assertIn("(out of date, needed)", out)
+        self.assertLess(out.index("theories/I1.v"), out.index("theories/I2.v"))
+        self.assertNotIn("I6.v", out)
+        self.write("I1.v", "Definition i := 2.\nLemma i_eq : i = 2.\nProof. reflexivity. Qed.\n")
+        out = sh("impact", os.path.join(d, "I1.v"), code=1)
+        self.assertIn("FAILED   theories/I2.v", out)
+        self.assertIn('File "./theories/I2.v", line 3', out)
+        self.assertIn("skipped  theories/I3.v (requires theories/I2.v, which failed)", out)
+        self.assertIn("FAILED   theories/I4.v", out)
+        self.assertIn("skipped  theories/I5.v (requires theories/I4.v, which failed)", out)
+        self.assertIn("1 compiled, 2 failed, 2 not checked", out)
+
+    def test_n_compact_goals_and_name_hints(self):
+        f = os.path.join(self.dir, "theories", "Hyp.v")
+        self.write("Hyp.v", "Lemma my_special_lemma : forall n : nat, n + 0 = n.\n"
+                   "Proof. intros n. rewrite <- plus_n_O. reflexivity. Qed.\n"
+                   "Lemma t : forall (a b c d : nat) (H1 : a = b) (H2 : b = c) (H3 : c = d), a + 0 = d.\n"
+                   "Proof.\n  intros.\n  rewrite H1.\nAdmitted.\n")
+        out = sh("goto", f + ":6", check=True)                     # full
+        self.assertIn("H3 : c = d", out)
+        out = sh("run", f, "rewrite H1.", check=True)
+        self.assertIn("(7 unchanged hypotheses not shown: a, b, c, d, H1, H2, H3)", out)
+        self.assertIn("b + 0 = d", out)
+        self.assertNotIn("H2 : b = c", out)
+        out = sh("run", f, "clear H3.", check=True)
+        self.assertIn("(no longer in context: H3)", out)
+        self.assertIn("H2 : b = c", sh("goals", f, check=True))     # goals: everything
+        self.assertIn("H2 : b = c", sh("run", f, "idtac.", check=True, env={"ROCQ_LIVE_COMPACT": "0"}))
+        out = sh("run", f, "rewrite my_specail_lemma.", check=False)  # a typo
+        self.assertIn("rocq-live hint: my_specail_lemma does not exist here; similar names:", out)
+        self.assertIn("  my_special_lemma : forall n : nat, n + 0 = n", out)
+        out = sh("run", f, "rewrite lemma_special_my.", check=False)  # parts in another order
+        self.assertIn("  my_special_lemma :", out)
         sh("stop", f)
 
     def test_5_stop_and_list(self):

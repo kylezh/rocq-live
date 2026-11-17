@@ -84,13 +84,14 @@ To see a proof state, use `rocq-live goto FILE:LINE` (state before LINE);
 try tactics with `rocq-live run FILE 'tac.'`, undo with `rocq-live back FILE`,
 query with `rocq-live query FILE 'Search ...'`. After editing FILE, goto again.
 To know whether FILE compiles, run `rocq-live check FILE` instead of coqc
-(same verdict, re-checks only what changed); `rocq-live compile FILE` writes
-the .vo when other files need it.
+(same verdict, re-checks only what changed; --all-errors lists every failing
+proof). After changing something other files use, `rocq-live impact FILE`
+compiles the files that require it and reports what broke.
 ```
 
-All tools except `rocq_compile` are marked read-only (`readOnlyHint`): they
-never write files, though a `goto` may build the file's imports, as a build
-would. `rocq_compile` exists to write `.vo` files.
+All tools except `rocq_compile` and `rocq_impact` are marked read-only
+(`readOnlyHint`): they never write files, though a `goto` may build the
+file's imports, as a build would. Those two exist to write `.vo` files.
 
 ## Commands
 
@@ -100,8 +101,9 @@ would. `rocq_compile` exists to write `.vo` files.
 | `run FILE[:LINE] 'tac1. tac2.'`  | `rocq_run`      | run on the current state (or on the state before LINE); an error changes nothing |
 | `query FILE 'Search …'`          | `rocq_query`    | run, print, undo (Search, Check, Print, About, …)       |
 | `try FILE 'lia' 'auto' …`        | `rocq_try`      | each tactic alone on the current state: which work, goals left (best first); state unchanged |
-| `check FILE [--allow-stale] [--rebuild]` | `rocq_check` | `coqc`'s verdict on the whole file, re-checking only what changed (see below) |
+| `check FILE [--allow-stale] [--rebuild] [--all-errors]` | `rocq_check` | `coqc`'s verdict on the whole file, re-checking only what changed (see below) |
 | `compile FILE [--deps-only]`     | `rocq_compile`  | write `.vo` files: FILE's out-of-date dependencies in order, then FILE |
+| `impact FILE`                    | `rocq_impact`   | what an edit to FILE breaks in other files: compile FILE and every file that requires it |
 | `audit FILE [NAME…] [--allow AX,…]` | `rocq_audit` | `Admitted`/`admit`/axioms, and `Print Assumptions` of each declaration against the allowed axioms: PASS/FAIL |
 | `back FILE [N]`                  | `rocq_back`     | undo the last N runs                                    |
 | `goals FILE`                     | `rocq_goals`    | current goals                                           |
@@ -169,6 +171,16 @@ does, but from the file's live session:
 
 It writes no `.vo`. A check that compiles is not a build, and your build
 stays in charge of `.vo` files.
+
+**`--all-errors`** (MCP: `all_errors`) reports every proof that fails, not
+just the first error. Each failing proof is closed with `Admitted` so that
+checking can go on, and later proofs that use it still check, as they will
+once it is fixed. After a change that breaks six proofs, an agent sees all
+six in one call instead of fixing them one per round. Each error is exactly
+the one `coqc` reports when that proof is the only broken one. An error
+outside a proof (in a statement, a definition or a `Require`) still stops the
+check, since what follows it would fail for that reason alone. The next check
+re-runs the proofs that were closed this way.
 
 **What an edit re-runs.** Rocq checks a file top to bottom, so in general
 everything after an edit is re-checked. rocq-live re-runs less, by keeping
@@ -258,6 +270,35 @@ prints the same list as a warning but goes on. The dependencies come from
 lines changed. dune projects don't need this check, since `dune rocq top`
 rebuilds the imports before each `goto` or `check`.
 
+**`impact FILE`** answers "what does my edit break in other files?". It
+finds every project file that requires FILE, directly or not, from the same
+`coqdep` graph. It then compiles FILE and those files in dependency order,
+`ROCQ_LIVE_JOBS` at a time (default: half the cores, at most 4), rebuilding
+any out-of-date file they need along the way. A file that fails is reported
+with `coqc`'s errors, and the files that require it are skipped, while
+independent branches go on:
+
+```
+$ rocq-live impact theories/A.v
+rocq-live impact theories/A.v: 4 file(s) require it
+ok       theories/A.v (0.0 s)
+FAILED   theories/B.v
+File "./theories/B.v", line 3, characters 13-17:
+Error:
+The term "a_eq" has type "a = 2" while it is expected to have type "a = 1".
+skipped  theories/C.v (requires theories/B.v, which failed)
+FAILED   theories/E.v
+File "./theories/E.v", line 3, characters 7-18:
+Error: Unable to unify "2" with "a + a".
+skipped  theories/F.v (requires theories/E.v, which failed)
+rocq-live: 1 compiled, 2 failed, 2 not checked [0.1 s, 4 job(s)]
+```
+
+Files that don't require FILE are not touched. In a dune project, `impact`
+runs one `dune build` of the same targets, and dune handles order and
+parallelism. Use `check --all-errors` on a failed file to see all of its
+errors.
+
 **`compile`** builds `.vo` files the way the project does: `coqc` with the
 load path (`_CoqProject`, `flags`), `dune build` in dune projects, or the
 `compile` command in `.rocq-live`. It builds FILE's out-of-date dependencies in
@@ -270,6 +311,40 @@ Assumptions` lists an axiom that is not allowed. Admitted lemmas count, since
 Rocq lists them as axioms. Allowed axioms come from `axioms` in `.rocq-live`,
 or from `--allow` / `allow`. With NAMEs, only those declarations are judged.
 The audit checks the whole file, then returns the session to where it was.
+
+**Compact goals.** In a large proof, most hypotheses stay the same from one
+step to the next, and re-reading them costs an agent tokens on every step.
+After a `run`, hypotheses unchanged since the goals last shown are replaced
+by one line naming them, and the ones that disappeared are listed. `try`
+shows each tactic's result the same way:
+
+```
+$ rocq-live run Foo.v 'rewrite H1.'
+1 goal (ID 11)
+  (11 unchanged hypotheses not shown: A, l, l2, x, y, z, w, H1, H2, H3, H4)
+  ============================
+  length (l ++ l2) + y = length l + length l2 + w
+```
+
+`goals` and `goto` always show everything. `ROCQ_LIVE_COMPACT=0` turns this
+off.
+
+**Similar names.** Models often misremember lemma names: a typo, the parts
+in another order (`app_length` and `length_app`), or a missing qualifier.
+When an error says a name does not exist, `rocq-live` searches the current
+environment (Rocq's `Search` by name, at most 8 s) and lists up to five
+similar names that do exist, with their types. The agent can then use the
+right one directly instead of spending a round on `Search`:
+
+```
+$ rocq-live run Foo.v 'rewrite app_lenght.'
+...
+Error: The variable app_lenght was not found in the current environment.
+rocq-live: error; state unchanged
+rocq-live hint: app_lenght does not exist here; similar names:
+  length_app : forall [A : Type] (l l' : list A), length (l ++ l') = length l + length l'
+  ...
+```
 
 **Hints.** For an error whose fix isn't in the message, a `rocq-live hint:`
 line follows it. This covers a missing load-path binding, a library that is
@@ -320,6 +395,8 @@ rocq-live cannot know where its `.vo` files go.
 | `ROCQ_LIVE_TRY_TIMEOUT` | seconds per tactic in `try` (default 30)             |
 | `ROCQ_LIVE_FAST`    | `0`: `goto` checks every proof (as `--full`)              |
 | `ROCQ_LIVE_REUSE`   | `0`: after an edit inside a proof, re-run every proof after it    |
+| `ROCQ_LIVE_JOBS`    | files `impact` compiles at once (default: half the cores, at most 4) |
+| `ROCQ_LIVE_COMPACT` | `0`: `run` and `try` show every hypothesis, not just the changed ones |
 | `ROCQ_LIVE_DAEMON`  | `0`: no background process (see [Recipes](https://github.com/kylezh/rocq-live#recipes-and-the-no-daemon-mode)) |
 
 The session limits below can also be set in the environment.
