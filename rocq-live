@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """rocq-live: live Rocq proof sessions for any project, no per-project setup.
+# SPDX-License-Identifier: MIT
 
   rocq-live goto  FILE[:LINE] [--full]  proof state just before LINE (default:
                                       end of file). Starts a session if none

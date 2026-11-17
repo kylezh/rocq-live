@@ -332,4 +332,4 @@ limits.
 
 ## License
 
-TBD
+[MIT](LICENSE)
